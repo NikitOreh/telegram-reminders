@@ -1,0 +1,22 @@
+[Unit]
+Description=Telegram reminders bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=reminderbot
+Group=reminderbot
+WorkingDirectory=/opt/telegram-reminders
+ExecStart=/opt/node22/bin/node /opt/telegram-reminders/bot.js
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/telegram-reminders
+
+[Install]
+WantedBy=multi-user.target

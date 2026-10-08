@@ -1,0 +1,13 @@
+[Unit]
+Description=Back up Telegram reminders bot state
+
+[Service]
+Type=oneshot
+User=reminderbot
+Group=reminderbot
+ExecStart=/opt/telegram-reminders/deploy/yandex/backup.sh
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/telegram-reminders

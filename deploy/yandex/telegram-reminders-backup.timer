@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Telegram reminders bot state every six hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=telegram-reminders-backup.service
+
+[Install]
+WantedBy=timers.target

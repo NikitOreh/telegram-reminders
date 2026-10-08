@@ -1,0 +1,19 @@
+{
+  "name": "telegram-reminders",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js",
+    "setup": "node setup.js",
+    "verify": "node verify.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "opentype.js": "^2.0.0",
+    "sharp": "^0.35.4"
+  }
+}
