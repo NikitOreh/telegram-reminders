@@ -123,6 +123,35 @@ test('разбор рекламы с двумя футбольными матч�
   assert.equal(extractOdds(text), '2,2+');
 });
 
+test('матчи с 🆚 и VS распознаются как пары команд', () => {
+  const text = '🏒 Калгари 🆚 Торонто\nВашингтон VS Питтсбург\n📊 КФ — 2,30';
+  assert.deepEqual(extractMatches(text), ['Калгари — Торонто', 'Вашингтон — Питтсбург']);
+  assert.equal(sportIconForMatch('Калгари — Торонто', '⚽️', text), '🏒');
+  assert.equal(extractOdds(text), '2,30');
+});
+
+test('коэффициент ставки не считается командой или матчем', () => {
+  for (const oddsLine of ['🔝 КФ ставки — 5,717', '📊 Коэф. ставки - 5.717', 'КФ — 5,717 в БК']) {
+    const text = `🏒 Нефтехимик — Сибирь\n🏒 Автомобилист — Амур\n${oddsLine}`;
+    assert.deepEqual(extractMatches(text), ['Нефтехимик — Сибирь', 'Автомобилист — Амур']);
+    assert.equal(extractOdds(text), '5,717');
+  }
+});
+
+test('КФ с одним или двумя дефисами и значки статистики обозначают коэффициент', () => {
+  const variants = [
+    ['КФ - 2,40', '2,40'], ['КФ -- 5.717', '5,717'],
+    ['📊 2,937', '2,937'], ['📈 — 2.2+', '2,2+'],
+    ['📉: 3,15', '3,15'], ['🔝 2', '2']
+  ];
+  for (const [line, odds] of variants) {
+    const text = `🏒 Нефтехимик — Сибирь\n${line}`;
+    assert.deepEqual(extractMatches(text), ['Нефтехимик — Сибирь']);
+    assert.equal(extractOdds(text), odds);
+  }
+  assert.equal(extractOdds('Разбор 1,25\n📊 5,717'), '5,717');
+});
+
 test('КХЛ и НХЛ определяются как хоккей даже без эмодзи', () => {
   assert.equal(sportIcon('Хоккей. Флорида — Тампа'), '🏒');
   assert.equal(sportIcon('КХЛ. Амур — Локомотив'), '🏒');
@@ -220,7 +249,9 @@ test('строка без скобок сразу превращается в к
   assert.deepEqual(parseButtonSpec('СМОТРЕТЬ ПРОГНОЗ - https://t.me/+ExampleInvite'), {
     text: 'СМОТРЕТЬ ПРОГНОЗ', url: 'https://t.me/+ExampleInvite'
   });
-  assert.throws(() => parseButtonSpec('СМОТРЕТЬ ПРОГНОЗ - http://example.com'));
+  assert.deepEqual(parseButtonSpec('СМОТРЕТЬ ПРОГНОЗ - http://example.com'), {
+    text: 'СМОТРЕТЬ ПРОГНОЗ', url: 'http://example.com'
+  });
 });
 
 test('изображение напоминания находится в цитате после текста', () => {

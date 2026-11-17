@@ -50,6 +50,23 @@ test('несколько матчей превращаются в одно по�
   assert.doesNotMatch(html, /Англия|Испания|Чехия|Хорватия|2,937/);
 });
 
+test('КФ ставки остаётся строкой коэффициента при импорте напоминания', () => {
+  const template = messageToTemplate('🏒 Нефтехимик — Сибирь\nКФ ставки — 5,717\n👇 Забрать прогноз');
+  assert.match(template.body, /КФ ставки — \{odds\}/);
+  const html = renderTemplate(template, { matches: ['Амур — Локомотив'], odds: '2,40', sportIcon: '🏒' });
+  assert.match(html, /КФ ставки — 2,40/);
+  assert.match(html, /Амур — Локомотив/);
+  assert.doesNotMatch(html, /5,717|Сибирь/);
+});
+
+test('импорт заменяет число после значка статистики на коэффициент', () => {
+  const template = messageToTemplate('🏒 Нефтехимик — Сибирь\n📊 -- 5.717\n👇 Забрать прогноз');
+  assert.match(template.body, /📊 -- \{odds\}/);
+  const html = renderTemplate(template, { matches: ['Амур — Локомотив'], odds: '2,40', sportIcon: '🏒' });
+  assert.match(html, /📊 -- 2,40/);
+  assert.doesNotMatch(html, /5\.717|Сибирь/);
+});
+
 test('текстовый импорт по-прежнему понимает ручное жирное выделение', () => {
   const template = messageToTemplate('**ПРОГНОЗ**\n{matches}\n{odds}');
   const html = renderTemplate(template, { matches: ['А — Б'], odds: '2,40' });

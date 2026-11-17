@@ -1,11 +1,19 @@
-param(
+﻿param(
   [string]$OutputPath = (Join-Path $env:TEMP ("telegram-reminders-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.tar.gz'))
 )
 
 $ErrorActionPreference = 'Stop'
 $projectDirectory = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $files = @(Get-ChildItem -LiteralPath $projectDirectory -File -Filter '*.js' | Select-Object -ExpandProperty Name)
-$files += @('package.json', 'package-lock.json', '.env', 'data.json', 'fonts', 'deploy')
+$files += @(
+  'package.json', 'package-lock.json', '.env', 'data.json',
+  'detect-person.py', 'requirements-vision.txt', 'detector-models',
+  'fonts', 'deploy'
+)
+$optionalDirectories = @('image-templates', 'team-assets', 'internet-assets')
+foreach ($directory in $optionalDirectories) {
+  if (Test-Path -LiteralPath (Join-Path $projectDirectory $directory)) { $files += $directory }
+}
 foreach ($file in $files) {
   if (-not (Test-Path -LiteralPath (Join-Path $projectDirectory $file))) {
     throw "Файл для переноса не найден: $file"
@@ -18,6 +26,7 @@ try {
   foreach ($file in $files | Where-Object { $_ -ne '.env' }) {
     Copy-Item -LiteralPath (Join-Path $projectDirectory $file) -Destination (Join-Path $stageDirectory $file) -Recurse -ErrorAction Stop
   }
+  Get-ChildItem -LiteralPath $stageDirectory -Directory -Recurse -Filter '__pycache__' | Remove-Item -Recurse -Force
   $envLines = @(Get-Content -LiteralPath (Join-Path $projectDirectory '.env') | Where-Object { $_ -notmatch '^\s*(?:export\s+)?OPENAI_API_KEY\s*=' })
   [System.IO.File]::WriteAllLines((Join-Path $stageDirectory '.env'), [string[]]$envLines, [System.Text.UTF8Encoding]::new($false))
   & tar.exe -czf $OutputPath -C $stageDirectory .

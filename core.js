@@ -1,4 +1,5 @@
 import { knownTeamSports, normalizedTeamName } from './team-aliases.js';
+import { entitiesToRichHtml } from './rich.js';
 
 export const MINUTE = 60_000;
 
@@ -121,11 +122,24 @@ export function parsePostDeleteMinutes(input) {
   return parseReminderDeleteMinutes(input);
 }
 
+export function isButtonUrl(value) {
+  if (typeof value !== 'string' || /\s/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && Boolean(url.hostname);
+  } catch { return false; }
+}
+
 export function parseButtonSpec(text) {
   const value = text.trim().replace(/^\[([\s\S]*)\]$/, '$1').trim();
-  const match = value.match(/^(.+?)\s+-\s+(https:\/\/\S+)$/i);
-  if (!match || !/^https:\/\/(?:t\.me|telegram\.me)\//i.test(match[2])) throw new Error('Формат кнопки: СМОТРЕТЬ ПРОГНОЗ - https://t.me/...');
+  const match = value.match(/^(.+?)\s+-\s+(https?:\/\/\S+)$/i);
+  if (!match || !isButtonUrl(match[2])) throw new Error('Формат кнопки: СМОТРЕТЬ ПРОГНОЗ - https://example.com/');
   return { text: match[1].trim(), url: match[2] };
+}
+
+export function parseContinuationSpec(text) {
+  const value = text.trim();
+  return isButtonUrl(value) ? { text: 'Читать продолжение…', url: value } : parseButtonSpec(value);
 }
 
 export function scheduleTimes(adStart, adEnd, deleteAfter = 30, postDeleteAfter = null) {
@@ -154,11 +168,12 @@ export function extractMatches(text) {
   const matches = [];
   for (const sourceLine of text.split(/\r?\n/)) {
     const line = cleanLine(sourceLine);
-    const found = line.match(/^(.{2,60}?)\s+[—–-]\s+(.{2,60})$/u);
+    const found = line.match(/^(.{2,60}?)(?:\s+[—–-]\s+|\s*🆚\uFE0F?\s*|\s+(?:vs?\.?|versus)\s+)(.{2,60})$/iu);
     if (!found) continue;
     const left = found[1].trim();
     const right = found[2].trim();
-    if (/^(?:коэффициент|кэф|прогноз|ставка|статус|лига)/i.test(left)) continue;
+    if (!/[\p{L}]/u.test(left) || !/[\p{L}]/u.test(right)) continue;
+    if (/^(?:коэффиц(?:иент)?|коэфф?|кэф|кф|прогноз|ставка|статус|лига)(?![\p{L}])/iu.test(left)) continue;
     if (/\d{4}|https?:|t\.me/i.test(left + right)) continue;
     const match = `${left} — ${right}`;
     if (!matches.includes(match)) matches.push(match);
@@ -166,9 +181,24 @@ export function extractMatches(text) {
   return matches.slice(0, 5);
 }
 
+export function findOddsSpan(text) {
+  const value = String(text || '');
+  const patterns = [
+    /(?<![\p{L}])(?:коэффиц(?:иент)?|коэфф?|кэф|кф)(?![\p{L}])[^\n\d]{0,32}(\d+(?:[.,]\d{1,3})?\+?)(?![\p{L}\d])/iu,
+    /(?:📊|📈|📉|🔝)[\s:—–=-]{0,8}(\d+(?:[.,]\d{1,3})?\+?)(?![\p{L}\d])/u,
+    /(?<![\p{L}\d])([12][.,]\d{1,3}\+?)(?![\p{L}\d])/u
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(value);
+    if (!match) continue;
+    const start = match.index + match[0].lastIndexOf(match[1]);
+    return { start, end: start + match[1].length, value: match[1].replace('.', ',') };
+  }
+  return null;
+}
+
 export function extractOdds(text) {
-  const match = text.match(/(?:коэффиц(?:иент)?|кэф|кф|📊)[^\n\d]{0,20}(\d+[.,]\d+\+?)/i) || text.match(/\b([12][.,]\d{1,2}\+?)\b/);
-  return match?.[1]?.replace('.', ',') ?? null;
+  return findOddsSpan(text)?.value ?? null;
 }
 
 const SPORT_MARKERS = [
@@ -215,7 +245,7 @@ export function sportIconForMatch(match, fallback = '⚽️', sourceText = '') {
       const mentioned = mentionedSportIcons(line);
       if (mentioned.length === 1) sectionIcon = mentioned[0];
       const normalizedLine = normalizedTeamName(line);
-      if (!/[—–-]/u.test(line) || !normalizedNames.every(name => name && normalizedLine.includes(name))) continue;
+      if (!extractMatches(line).length || !normalizedNames.every(name => name && normalizedLine.includes(name))) continue;
       lineIcon = mentioned[0] || sectionIcon;
       break;
     }
@@ -302,10 +332,26 @@ function normalizeReminderSpacing(text, rich = false) {
   return text.replace(/(?:[ \t]*\r?\n){3,}/g, '\n\n');
 }
 
-export function renderTemplate(template, { matches, odds, sportIcon: icon = '⚽️', sourceText = '' }) {
+function matchDisplayHtml(match, icon, sourceText, sourceEntities) {
+  let offset = 0;
+  for (const line of sourceText.split('\n')) {
+    const entities = sourceEntities.filter(entity => entity.type === 'custom_emoji' &&
+        entity.offset >= offset && entity.offset + entity.length <= offset + line.length)
+        .map(entity => ({ ...entity, offset: entity.offset - offset }));
+    if (extractMatches(line).includes(match) && (entities.length || /[\u{1F1E6}-\u{1F1FF}]|🏴|🏳/u.test(line))) {
+      const original = entities.length ? line : line.replace(/\*\*/g, '');
+      return entitiesToRichHtml(original, entities).trim();
+    }
+    offset += line.length + 1;
+  }
+  return `${escapeHtml(sportIconForMatch(match, icon, sourceText))} ${escapeHtml(match)}`;
+}
+
+export function renderTemplate(template, { matches, odds, sportIcon: icon = '⚽️', sourceText = '', sourceEntities = [] }) {
+  const matchLines = matches.map(match => matchDisplayHtml(match, icon, sourceText, sourceEntities));
   if (template?.format === 'rich_html') {
     const replacements = {
-      '{matches}': matches.map(match => `${escapeHtml(sportIconForMatch(match, icon, sourceText))} ${escapeHtml(match)}`).join('<br>'),
+      '{matches}': matchLines.join('<br>'),
       '{odds}': escapeHtml(odds || ''),
       '{sport}': escapeHtml(icon)
     };
@@ -317,7 +363,7 @@ export function renderTemplate(template, { matches, odds, sportIcon: icon = '⚽
     sport: icon
   };
   const parts = String(template).replace(/⚽️?/gu, '{sport}').split(/(\{matches\}|\{odds\}|\{sport\})/g);
-  const escaped = parts.map(part => /^\{(?:matches|odds|sport)\}$/.test(part) ? escapeHtml(replacements[part.slice(1, -1)]) : escapeHtml(part)).join('');
+  const escaped = parts.map(part => part === '{matches}' ? matchLines.join('\n') : /^\{(?:odds|sport)\}$/.test(part) ? escapeHtml(replacements[part.slice(1, -1)]) : escapeHtml(part)).join('');
   return normalizeReminderSpacing(escaped.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>'));
 }
 
@@ -328,7 +374,7 @@ export function parseScheduleCommand(text) {
   const start = parseFlexibleMoscow(startText);
   const end = parseFlexibleMoscow(endText);
   const deleteAfter = parseDurationMinutes(deleteText);
-  if (!/^https:\/\/(?:t\.me|telegram\.me)\//i.test(url)) throw new Error('Ссылка кнопки должна начинаться с https://t.me/');
+  if (!isButtonUrl(url)) throw new Error('Укажите корректную ссылку HTTP или HTTPS');
   if (!buttonText || buttonText.length > 64) throw new Error('Текст кнопки должен быть от 1 до 64 символов');
   const times = scheduleTimes(start, end, deleteAfter);
   return { start, end, deleteAfter, url, buttonText, times };

@@ -10,6 +10,15 @@ data*.json
 *.sqlite*
 *.pem
 *.key
+*.ppk
+*.pub
+*.p12
+*.pfx
+application_default_credentials.json
+credentials*.json
+*service-account*.json
+secrets*.json
+.cloud-tools/
 *.zip
 *.tar.gz
 *.token

@@ -1,4 +1,4 @@
-import { extractMatches, extractOdds } from './core.js';
+import { extractMatches, findOddsSpan } from './core.js';
 import { entitiesToRichHtml } from './rich.js';
 
 function replaceSpan(value, entities, start, end, replacement) {
@@ -28,21 +28,6 @@ function matchLineSpans(text) {
   return spans;
 }
 
-function oddsSpan(text) {
-  const labeled = text.match(/(?:коэффиц(?:иент)?|кэф|кф|📊)[^\n\d]{0,20}(\d+[.,]\d+\+?)/i);
-  if (labeled) {
-    const number = labeled[1];
-    const start = labeled.index + labeled[0].lastIndexOf(number);
-    return { start, end: start + number.length };
-  }
-  const odds = extractOdds(text);
-  if (!odds) return null;
-  const escaped = odds.replace(',', '___SEP___').replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('___SEP___', '[.,]');
-  const pattern = new RegExp(`(?<!\\d)${escaped}(?!\\d)`, 'i');
-  const found = pattern.exec(text);
-  return found ? { start: found.index, end: found.index + found[0].length } : null;
-}
-
 export function messageToTemplate(text, sourceEntities = []) {
   const sourceText = String(text || '');
   if (!sourceText.trim() || sourceText.length > 4000) throw new Error('Текст шаблона должен содержать от 1 до 4000 символов');
@@ -56,7 +41,7 @@ export function messageToTemplate(text, sourceEntities = []) {
     }
   }
   if (!value.includes('{odds}')) {
-    const span = oddsSpan(value);
+    const span = findOddsSpan(value);
     if (span) ({ text: value, entities } = replaceSpan(value, entities, span.start, span.end, '{odds}'));
   }
   let body = entitiesToRichHtml(value, entities);

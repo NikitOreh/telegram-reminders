@@ -1,4 +1,14 @@
 import { photoMayOmitCredit } from './photo-license.js';
+import { hiddenButton } from './hidden-content.js';
+
+export function syncAutomaticPostDeletion(draft, postAt = draft.postAt) {
+  if (draft.postDeleteAuto !== true || !postAt || !draft.adEnd) return false;
+  const minutes = Math.ceil((draft.adEnd - postAt) / 60_000);
+  if (minutes < 1) throw new Error('Конец размещения должен быть позже выхода рекламы');
+  if (minutes > 47 * 60 + 59) throw new Error('Автоматическое удаление поста возможно не позднее 47 часов 59 минут после выхода. Выберите более ранний конец или «Не удалять».');
+  draft.postDeleteAfter = minutes;
+  return true;
+}
 
 export function reminderOverride(campaign, index) {
   return campaign.reminderOverrides?.[index] || {};
@@ -25,7 +35,7 @@ export function reminderPhotoFor(campaign, index) {
 }
 
 export function reminderButtonFor(campaign, index) {
-  return reminderOverride(campaign, index).button || { text: campaign.buttonText || campaign.schedule?.buttonText || 'ПРОГНОЗ',
+  return reminderOverride(campaign, index).button || hiddenButton(campaign) || { text: campaign.buttonText || campaign.schedule?.buttonText || 'ПРОГНОЗ',
     url: campaign.url || campaign.schedule?.url };
 }
 
@@ -76,11 +86,38 @@ export function removeReminder(campaign, jobs, index, now = Date.now()) {
 
 export function setPostDeleteAfter(campaign, jobs, minutes) {
   campaign.postDeleteAfter = minutes;
+  if (campaign.postRemoved) return;
   for (const job of jobs) {
     if (job.kind !== 'post' || !['sent', 'published'].includes(job.status)) continue;
     job.deleteAt = minutes === null ? null : (job.publishedAt || job.at) + minutes * 60_000;
     job.status = minutes === null ? 'published' : 'sent';
   }
+}
+
+export function removeCampaignPost(campaign, jobs, now = Date.now()) {
+  if (!campaign.postManaged || campaign.postRemoved) throw new Error('Рекламный пост уже удалён или не публикуется этим ботом');
+  campaign.postManaged = false;
+  campaign.postRemoved = true;
+  campaign.remindersOnly = true;
+  let canceled = 0;
+  let deleting = 0;
+  let uncertain = 0;
+  for (const job of jobs) {
+    if (job.campaignId !== campaign.id || job.kind !== 'post') continue;
+    job.failureNotificationPending = false;
+    job.ownerNotificationPending = false;
+    if (['pending', 'failed'].includes(job.status)) {
+      job.status = 'canceled';
+      job.retryAt = null;
+      canceled++;
+    } else if (['sent', 'published', 'failed_delete', 'uncertain'].includes(job.status) && job.messageId) {
+      job.status = 'sent';
+      job.deleteAt = now;
+      job.syncRetryAt = null;
+      deleting++;
+    } else if (job.status === 'sending' || job.status === 'uncertain') uncertain++;
+  }
+  return { canceled, deleting, uncertain };
 }
 
 export function moveCampaignSchedule(campaign, jobs, nextPostAt) {

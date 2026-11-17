@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 import sharp from 'sharp';
 import { splitMatch } from './card.js';
 import { teamSearchQuery } from './team-art.js';
@@ -10,10 +11,13 @@ import { teamSearchVariants } from './team-aliases.js';
 import { resolveTeamNameVariants } from './team-language.js';
 import { conflictsWithCompetition, matchCompetition } from './match-competition.js';
 import { imageShowsSportPeople } from './image-people.js';
+import { searchYandexWebImages } from './yandex-web.js';
+import { imageHasDisallowedText } from './image-date.js';
+import { orderedPrefetch } from './ordered-prefetch.js';
 
 const DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'internet-assets');
 const SEARCH_CACHE_TTL = 7 * 86_400_000;
-const SEARCH_CACHE_VERSION = 7;
+const SEARCH_CACHE_VERSION = 8;
 const COMMONS_API = 'https://commons.wikimedia.org/w/api.php';
 const YANDEX_IMAGE_API = 'https://searchapi.api.cloud.yandex.net/v2/image/search';
 const USER_AGENT = 'TelegramMatchReminders/0.1 (match photo search)';
@@ -157,11 +161,11 @@ export function matchPhotoCandidates(pages, match, sportIcon, options = {}) {
   return candidates.sort((a, b) => b.score - a.score || a.searchIndex - b.searchIndex);
 }
 
-async function fetchBytes(url) {
+async function fetchBytes(url, signal) {
   let response;
   for (let hop = 0; hop < 4; hop++) {
     if (!safePublicImageUrl(url)) throw new Error('Небезопасная ссылка на изображение');
-    response = await fetch(url, { signal: AbortSignal.timeout(15_000), redirect: 'manual',
+    response = await fetch(url, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000), redirect: 'manual',
       headers: { 'user-agent': USER_AGENT } });
     if (![301, 302, 303, 307, 308].includes(response.status)) break;
     const next = response.headers.get('location');
@@ -235,21 +239,23 @@ export function yandexPhotoCandidates(xml, match, sportIcon, options = {}) {
   return results.sort((a, b) => b.score - a.score || a.searchIndex - b.searchIndex);
 }
 
-async function cachedImage(sourceUrl) {
+async function cachedImage(sourceUrl, signal) {
+  signal?.throwIfAborted();
   const key = createHash('sha256').update(sourceUrl).digest('hex').slice(0, 24);
   const cached = path.join(DIR, `${key}.png`);
   try { return await fs.readFile(cached); }
   catch (error) {
     if (error.code !== 'ENOENT') throw error;
     let bytes;
-    try { bytes = await fetchBytes(sourceUrl); }
+    try { bytes = await fetchBytes(sourceUrl, signal); }
     catch (error) {
       if (error.status !== 429 || error.retryAfter > 5) throw error;
-      await new Promise(resolve => setTimeout(resolve, Math.max(2000, error.retryAfter * 1000)));
-      bytes = await fetchBytes(sourceUrl);
+      await delay(Math.max(2000, error.retryAfter * 1000), undefined, { signal });
+      bytes = await fetchBytes(sourceUrl, signal);
     }
     const image = await sharp(bytes)
       .resize(1254, 1254, { fit: 'inside', withoutEnlargement: true }).png().toBuffer();
+    signal?.throwIfAborted();
     await fs.mkdir(DIR, { recursive: true });
     await fs.writeFile(cached, image);
     return image;
@@ -320,26 +326,49 @@ async function searchYandex(query, match, sportIcon, options = {}) {
   return candidates;
 }
 
+async function searchYandexPage(query, match, sportIcon, options) {
+  const key = createHash('sha256').update(JSON.stringify([query, match, sportIcon, options.context])).digest('hex').slice(0, 24);
+  const cachePath = path.join(DIR, `yandex-web-${key}.json`);
+  let images;
+  try {
+    const cached = JSON.parse(await fs.readFile(cachePath, 'utf8'));
+    if (cached.version === SEARCH_CACHE_VERSION && Date.now() - cached.checkedAt < SEARCH_CACHE_TTL) images = cached.images;
+  } catch { /* No cached search. */ }
+  if (!Array.isArray(images)) {
+    images = await searchYandexWebImages(query);
+    await fs.mkdir(DIR, { recursive: true });
+    await fs.writeFile(cachePath, JSON.stringify({ version: SEARCH_CACHE_VERSION, checkedAt: Date.now(), images }), 'utf8');
+  }
+  const escape = value => String(value || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+  const xml = images.map(image => `<doc><url>${escape(image.url)}</url><title>${escape(image.title)}</title><page-url>${escape(image.pageUrl)}</page-url><original-width>${image.width}</original-width><original-height>${image.height}</original-height></doc>`).join('');
+  return yandexPhotoCandidates(xml, match, sportIcon, options);
+}
+
 export async function collectMatchBackgrounds(matches, count, searchOne) {
-  const required = Math.ceil(count / 2);
+  const required = count;
   const images = [];
   const errors = [];
   const seen = new Set();
   for (const entry of matches) {
     if (images.length >= required) break;
     try {
-      const found = await searchOne(entry, (required - images.length) * 2, images.map(image => image.sourceUrl));
+      const found = await searchOne(entry, required - images.length, images.map(image => image.sourceUrl));
       for (const image of found) {
         if (seen.has(image.sourceUrl)) continue;
         seen.add(image.sourceUrl);
         images.push(image);
+        if (images.length >= required) break;
       }
-    } catch (error) { errors.push({ match: entry.match, error }); }
+    } catch (error) {
+      if (error.backgroundCanceled) throw error;
+      errors.push({ match: entry.match, error });
+    }
   }
   return { images, errors };
 }
 
 export async function getInternetMatchBackgrounds(match, sportIcon, count = 1, options = {}) {
+  options.checkActive?.();
   const alternatives = (options.fallbackMatches || []).filter(item => item?.match && item.match !== match);
   if (alternatives.length) {
     const matches = [{ match, sportIcon }, ...alternatives];
@@ -381,44 +410,80 @@ export async function getInternetMatchBackgrounds(match, sportIcon, count = 1, o
   ])];
   const candidates = [];
   let rateLimited = false;
-  for (const query of queries) {
-    try {
-      for (const candidate of matchPhotoCandidates(await searchCommons(query), match, sportIcon, searchOptions)) {
-        if (!candidates.some(item => item.sourcePage === candidate.sourcePage)) candidates.push(candidate);
-      }
-    } catch (error) {
-      console.warn(`Не удалось поискать изображение команды «${query}»: ${error.message}`);
-      if (error.status === 429) { rateLimited = true; break; }
-    }
-    if (candidates.filter(candidate => candidate.preferred).length >= Math.ceil(count / 2) &&
-      query === `${englishTeams[1]} ${sportEnglish}`) break;
-  }
   const images = [];
   let downloadRateLimited = false;
   let visionError = null;
   const seenUrls = new Set();
+  const seenImageHashes = new Set();
   const excludedUrls = new Set(options.excludedSourceUrls || []);
   async function downloadAll(found) {
-    for (const candidate of found.sort((a, b) => b.score - a.score || a.searchIndex - b.searchIndex)) {
-      if (images.length >= count) break;
-      if (seenUrls.has(candidate.sourceUrl) || excludedUrls.has(candidate.sourceUrl)) continue;
-      seenUrls.add(candidate.sourceUrl);
+    if (images.length >= count || visionError) return;
+    const unique = found.sort((a, b) => b.score - a.score || a.searchIndex - b.searchIndex)
+      .filter(candidate => {
+        if (seenUrls.has(candidate.sourceUrl) || excludedUrls.has(candidate.sourceUrl)) return false;
+        seenUrls.add(candidate.sourceUrl);
+        return true;
+      });
+    for await (const result of orderedPrefetch(unique,
+      (candidate, signal) => cachedImage(candidate.sourceUrl, signal), { concurrency: 3, checkActive: options.checkActive })) {
+      const candidate = result.item;
+      options.checkActive?.();
       try {
-        const image = await cachedImage(candidate.sourceUrl);
+        if (!result.ok) throw result.error;
+        const image = result.value;
+        options.checkActive?.();
+        const imageHash = createHash('sha256').update(image).digest('hex');
+        if (seenImageHashes.has(imageHash)) continue;
         if (!await imageShowsSportPeople(image, sportIcon)) continue;
+        options.checkActive?.();
+        if (await imageHasDisallowedText(image)) continue;
+        options.checkActive?.();
+        seenImageHashes.add(imageHash);
         images.push({ ...candidate, image });
+        if (images.length >= count) break;
       }
       catch (error) {
+        if (error.backgroundCanceled) throw error;
         console.warn(`Не удалось загрузить изображение команды «${candidate.title}»: ${error.message}`);
         if (error.status === 429) downloadRateLimited = true;
         if (error.visionService) { visionError = error; break; }
       }
     }
   }
+  const webQueries = [...new Set([
+    `${russianTeams.join(' ')} ${leagueRussian} матч фото`,
+    `${englishTeams.join(' ')} ${leagueEnglish} game photos`,
+    ...englishTeams.map(team => `${team} ${leagueEnglish} players game photos`)
+  ])];
+  for (const query of webQueries) {
+    options.checkActive?.();
+    if (images.length >= count || visionError) break;
+    try { await downloadAll((await searchYandexPage(query, match, sportIcon, searchOptions)).slice(0, 12)); }
+    catch (error) {
+      if (error.backgroundCanceled) throw error;
+      console.warn(`Поиск Яндекс.Картинок недоступен: ${error.message}`);
+      // Do not retry or bypass a captcha or a rejected request.
+      break;
+    }
+  }
+  if (images.length < count && !visionError) for (const query of queries) {
+    options.checkActive?.();
+    try {
+      for (const candidate of matchPhotoCandidates(await searchCommons(query), match, sportIcon, searchOptions)) {
+        if (!candidates.some(item => item.sourcePage === candidate.sourcePage)) candidates.push(candidate);
+      }
+    } catch (error) {
+      if (error.backgroundCanceled) throw error;
+      console.warn(`Не удалось поискать изображение команды «${query}»: ${error.message}`);
+      if (error.status === 429) { rateLimited = true; break; }
+    }
+    await downloadAll(candidates);
+    if (images.length >= count || visionError) break;
+  }
   await downloadAll(candidates);
   if (visionError && images.length * 2 < count) throw new Error(`${visionError.message}. Повторите позже или загрузите свои фото.`);
   let yandexAuthError = false;
-  if (images.length * 2 < count && process.env.YANDEX_SEARCH_API_KEY && process.env.YANDEX_FOLDER_ID) {
+  if (images.length < count && !visionError && process.env.YANDEX_SEARCH_API_KEY && process.env.YANDEX_FOLDER_ID) {
     const yandexQueries = [...new Set([
       `${russianTeams.join(' ')} ${leagueRussian} игроки матч фото`,
       `${russianTeams.join(' ')} ${leagueRussian} ${athletesRussian}`,
@@ -426,12 +491,14 @@ export async function getInternetMatchBackgrounds(match, sportIcon, count = 1, o
       `${englishTeams.join(' ')} ${leagueEnglish} players match photo`
     ])];
     for (const query of yandexQueries) {
+      options.checkActive?.();
       try { await downloadAll(await searchYandex(query, match, sportIcon, searchOptions)); }
       catch (error) {
+        if (error.backgroundCanceled) throw error;
         console.warn(`Не удалось поискать изображения через Яндекс: ${error.message}`);
         if ([401, 403].includes(error.status)) { yandexAuthError = true; break; }
       }
-      if (images.length * 2 >= count) break;
+      if (images.length >= count) break;
     }
   }
   if (images.length * 2 < count) {

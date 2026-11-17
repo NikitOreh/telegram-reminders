@@ -4,13 +4,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_TEMPLATES, MINUTE, extractMatches, extractOdds, formatMoscow,
-  parseScheduleCommand, parseFlexibleMoscow, parseDurationMinutes, parseReminderDeleteMinutes, parsePostDeleteMinutes, parseButtonSpec, scheduleTimes,
+  parseScheduleCommand, parseFlexibleMoscow, parseDurationMinutes, parseReminderDeleteMinutes, parsePostDeleteMinutes, parseButtonSpec, parseContinuationSpec, isButtonUrl, scheduleTimes,
   renderTemplate, sportIcon, sportIconForMatch, hasMixedMatchSports
 } from './core.js';
 import { getInternetMatchBackgrounds } from './internet-art.js';
 import { imageSettingsFor } from './image-source.js';
-import { compatibleReminderTemplates, distributeManualPhotos, repeatAtMostTwice, selectReminderTemplates, validateCaptionRepetitions } from './series-assets.js';
-import { buildCampaignJobs, moveCampaignSchedule, reminderButtonFor, reminderCaptionFor, reminderDeleteAfterFor, reminderIsRemoved, reminderPhotoFor, reminderTimeFor, removeReminder, setPostDeleteAfter, setReminderOverride, validateReminderTime } from './reminder-settings.js';
+import { compatibleReminderTemplates, distributeManualPhotos, repeatAtMostTwice, selectReminderTemplates, extendReminderTemplates, validateCaptionRepetitions } from './series-assets.js';
+import { planLiveSchedule, applyLiveSchedule, campaignHasStarted } from './live-schedule.js';
+import { buildCampaignJobs, moveCampaignSchedule, reminderButtonFor, reminderCaptionFor, reminderDeleteAfterFor, reminderIsRemoved, reminderPhotoFor, reminderTimeFor, removeReminder, removeCampaignPost, setPostDeleteAfter, setReminderOverride, syncAutomaticPostDeletion, validateReminderTime } from './reminder-settings.js';
 import { contentPlanEntries, deletionLabel, moscowDay, planEntryTitle, shiftMoscowDay } from './content-plan.js';
 import { entitiesToRichHtml, richWithQuotedPhoto, reminderRichMessage, richPhotoFileId } from './rich.js';
 import { messageToTemplate, removeTextTemplate, templateIdentity, templateText } from './text-templates.js';
@@ -21,6 +22,12 @@ import { timerKeyboard } from './timer-menu.js';
 import { buildItemCopyCampaign } from './item-copy.js';
 import { publicationGroupKey, publicationGroupNotice, publicationGroupReady, publicationNetworkKey, stalePublicationNotices } from './publication-notice.js';
 import { publicationDeadline, shouldRetryPublication } from './job-delivery.js';
+import { createHealthMonitor, startHealthServer } from './health.js';
+import { previewIsCurrent, shouldPreparePreview } from './preview-policy.js';
+import { reminderImageSourceKey, migratePreparedPhotoKey, preparedPhotosAreCurrent, refreshPreparedPreview, finishPreviewPreparation, retainedLivePhotos } from './preview-assets.js';
+import { postButtons, postKeyboard, originalContent, primaryPostButton } from './post-links.js';
+import { hiddenText, answerHiddenContinuation } from './hidden-content.js';
+import { createBackgroundQueue, createKeyedExecutor } from './background-tasks.js';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = path.join(DIR, 'data.json');
@@ -40,6 +47,9 @@ const API = `https://api.telegram.org/bot${TOKEN}`;
 const { state, rawState, currentUserId, runForUser } = createUserState(await loadState(), OWNER_ID);
 let busy = false;
 let saving = Promise.resolve();
+const preparationQueue = createBackgroundQueue();
+const userActions = createKeyedExecutor();
+const health = createHealthMonitor();
 const CHANNEL_TITLES = new Map();
 const USER_CHANNELS = new Map();
 let botUserId = null;
@@ -117,11 +127,23 @@ async function loadState() {
       draft.sportIcon = sportIcon(draft.sourceText || '');
       if (draft.reminderDeleteAfter === undefined) draft.reminderDeleteAfter = 30;
       draft.remindersEnabled ??= Boolean(draft.matches?.length && draft.odds);
+      if (draft.postDeleteAuto === undefined) {
+        draft.postDeleteAuto = !draft.editingCampaignId && draft.postDeleteAfter == null;
+        if (draft.postDeleteAuto && draft.postAt && draft.adEnd) {
+          const hadCurrentPreview = draft.previewedAt && draft.previewedAt >= draft.editedAt;
+          try {
+            syncAutomaticPostDeletion(draft);
+            draft.autoPreviewAfterMetadataEdit = Boolean(hadCurrentPreview);
+            draft.editedAt = Math.max(Date.now(), (draft.previewedAt || 0) + 1);
+          } catch { draft.postDeleteAuto = false; }
+        }
+      }
       draft.sourceEntities ||= [];
       draft.mainMediaType ||= draft.videoId ? 'video' : draft.photoId ? 'photo' : null;
       draft.buttons ||= draft.url ? [{ text: draft.buttonText || 'ПРОГНОЗ', url: draft.url }] : [];
       draft.channelIds ||= [...new Set(draft.networkKeys.flatMap(key => NETWORKS[key] || []))];
       Object.assign(draft, imageSettingsFor(draft));
+      migratePreparedPhotoKey(draft);
       if (draft.reminderPhotoStyleVersion !== CARD_STYLE_VERSION) {
         draft.reminderPhotoId = null;
         draft.reminderPhotoIds = null;
@@ -241,7 +263,6 @@ async function briefNotice(text, extra = {}) {
 }
 const short = value => Array.from(value).length > 3800 ? Array.from(value).slice(0, 3800).join('') + '\n…' : value;
 const MENU = { keyboard: [[{ text: '➕ Новый пост' }, { text: '📅 Контент-план' }], [{ text: '📚 Шаблоны текстов' }, { text: '❓ Помощь' }]], resize_keyboard: true };
-const BUTTON_URL = /^https:\/\/(?:t\.me|telegram\.me)\//i;
 const TEXT_TEMPLATE_PAGE_SIZE = 12;
 
 function replyError(message) {
@@ -268,11 +289,14 @@ function editorKeyboard(draft) {
       ? [[{ text: '🔄 Перенайти картинки', callback_data: 'edit:reroll_images' }]] : []),
     [...(channelSelectionEditable ? [{ text: `📍 ${networkLabelForChannels(selectedChannels(draft))}`, callback_data: 'edit:network' }] : []), { text: '🔗 Кнопка', callback_data: 'edit:button' }],
     ...(channelSelectionEditable ? [[{ text: '📋 Копировать в каналы', callback_data: 'edit:copy' }]] : []),
-    ...(managesPost ? [[{ text: `⏱ Удаление поста: ${draft.postDeleteAfter ? deletionLabel(draft.postDeleteAfter) : 'не удалять'}`, callback_data: 'edit:delete' }]] : []),
+    ...(managesPost ? [[{ text: `⏱ Удаление поста: ${draft.postDeleteAfter ? deletionLabel(draft.postDeleteAfter) : draft.postDeleteAuto ? 'авто после ввода времени' : 'не удалять'}`, callback_data: 'edit:delete' }]] : []),
     ...(draft.remindersEnabled === false ? [] : [[{ text: `⏱ Удаление напоминаний: ${draft.reminderDeleteAfter === null ? 'не удалять' : deletionLabel(draft.reminderDeleteAfter ?? 30)}`, callback_data: 'edit:reminder_delete' }]]),
+    ...(!draft.editingCampaignId
+      ? [[{ text: '🕓 Ввести время', callback_data: 'edit:set_schedule' }]]
+      : [[{ text: '🕓 Время выхода', callback_data: 'edit:time' }, ...(draft.remindersEnabled === false ? [] : [{ text: '🏁 Конец рекламы', callback_data: 'edit:end' }])]]),
     ...(draft.editingCampaignId
-      ? [[{ text: '💾 Сохранить изменения', callback_data: 'edit:save' }]]
-      : [[{ text: '🕓 Отложить', callback_data: 'edit:defer' }], [{ text: '🚀 Опубликовать сейчас', callback_data: 'edit:publish_now' }], [{ text: '❌ Отменить создание', callback_data: 'edit:discard' }]])
+      ? [[{ text: '💾 Сохранить изменения', callback_data: 'edit:save' }], ...(managesPost ? [[{ text: '🗑 Удалить только рекламный пост', callback_data: `post:remove_only:${draft.editingCampaignId}` }]] : [])]
+      : [[{ text: '🕓 Отложить', callback_data: 'edit:defer' }], ...(draft.remindersEnabled === false ? [] : [[{ text: '🔔 Отложить без поста', callback_data: 'edit:defer_reminders' }]]), [{ text: '🚀 Опубликовать сейчас', callback_data: 'edit:publish_now' }], [{ text: '❌ Отменить создание', callback_data: 'edit:discard' }]])
   ] };
 }
 
@@ -292,16 +316,6 @@ function networkLabelForChannels(channels = []) {
   return labels.join(', ') || 'Сетка не выбрана';
 }
 
-function reminderImageSourceKey(draft) {
-  if (draft.imageSource === 'internet') {
-    const matches = (draft.matches || []).map(match => [match, sportIconForMatch(match, draft.sportIcon, draft.sourceText)]);
-    const signature = createHash('sha256').update(JSON.stringify([matches, draft.sourceText])).digest('hex').slice(0, 16);
-    return `internet:team-images-v9:second-match-fallback:${signature}`;
-  }
-  if (draft.imageSource === 'manual') return `manual:${createHash('sha256').update(JSON.stringify(draft.manualReminderPhotoIds || [])).digest('hex').slice(0, 16)}`;
-  throw new Error('Выберите свои фото или поиск в интернете');
-}
-
 function manualPhotoLimit(draft) {
   if (!draft.postAt || !draft.adEnd) return 48;
   return scheduleTimes(draft.postAt, draft.adEnd, draft.reminderDeleteAfter, draft.postDeleteAfter).filter(at => at >= Date.now() + MINUTE).length || 1;
@@ -314,28 +328,31 @@ async function promptManualPhotos() {
     reply_markup: { inline_keyboard: [
       [{ text: '✅ Готово', callback_data: 'manual:done' }],
       [{ text: '🗑 Очистить загруженные фото', callback_data: 'manual:reset' }],
+      [{ text: '🌐 Искать фото в интернете', callback_data: 'source:internet' }],
       [{ text: '← К черновику', callback_data: 'nav:back' }]
     ] }
   });
 }
 
-function postButtons(post) {
-  return post.buttons?.length ? post.buttons : post.url ? [{ text: post.buttonText || 'ПРОГНОЗ', url: post.url }] : [];
-}
-
-function postKeyboard(post) {
-  const buttons = postButtons(post);
-  return buttons.length ? { inline_keyboard: buttons.map(button => [{ text: button.text, url: button.url }]) } : undefined;
-}
-
 function draftSummary(draft) {
   const channels = selectedChannels(draft).filter(id => allowedChannels().has(id));
+  const start = draft.postAt ? formatMoscow(draft.postAt) : null;
+  const deletedAt = draft.postAt && draft.postDeleteAfter ? formatMoscow(draft.postAt + draft.postDeleteAfter * MINUTE) : null;
+  const sameDay = deletedAt && start.slice(0, 10) === deletedAt.slice(0, 10);
+  const startLabel = sameDay || !deletedAt ? start?.slice(-5) : start;
+  const endLabel = sameDay ? deletedAt.slice(-5) : deletedAt;
+  const scheduleLabel = !start ? 'задаётся при откладывании' :
+    deletedAt ? `${startLabel}-${endLabel} МСК` : `${startLabel} МСК (не удалять)`;
   return [
     draft.remindersEnabled === false ? '📝 Черновик поста' : '📝 Черновик напоминаний',
     `Медиа рекламы: ${draft.photoId ? '+' : '-'}`,
     `Каналы: ${channels.length ? channels.map(id => CHANNEL_TITLES.get(id) || id).join(', ') : 'не выбраны'}${draft.editingCampaignId ? '\nИзменения серии применятся ко всем её копиям.' : ''}`,
-    `Выход рекламы: ${draft.postAt ? `${formatMoscow(draft.postAt)} МСК` : 'задаётся при откладывании'}`,
-    `Кнопки: ${postButtons(draft).length ? postButtons(draft).map(b => b.text).join(', ') : 'не заданы'}`,
+    `Выход рекламы: ${scheduleLabel}`,
+    ...(draft.buttonMode === 'hidden' ? [
+      `Скрытое продолжение: ${draft.hiddenContinuation?.title || 'не задано'}`,
+      `Подписчикам: ${draft.hiddenContinuation?.subscriberText || 'не задано'}`,
+      `Неподписанным: ${draft.hiddenContinuation?.nonSubscriberText || 'не задано'}`
+    ] : [`${draft.buttonMode === 'continuation' ? 'Ссылка в тексте' : 'Кнопки'}: ${postButtons(draft).length ? postButtons(draft).map(b => `${b.text} - ${b.url}`).join('; ') : 'не заданы'}`]),
     ...(draft.remindersEnabled === false ? [] : [`Матчи: ${draft.matches?.join('; ') || 'не определены'}`, `Коэффициент: ${draft.odds || 'не определён'}`])
   ].join('\n');
 }
@@ -436,7 +453,27 @@ async function showTextTemplate(index) {
   });
 }
 
-function markEdited() { state.draft.editedAt = Date.now(); }
+function markEdited() {
+  const draft = state.draft;
+  draft.autoPreviewAfterMetadataEdit = Boolean(draft.previewedAt || draft.editingCampaignId);
+  draft.editedAt = Math.max(Date.now(), (draft.editedAt || 0) + 1, (draft.previewedAt || 0) + 1);
+}
+
+async function selectDraftImageSource(choice) {
+  const draft = state.draft;
+  draft.imageSource = choice;
+  draft.reminderPhotoId = null;
+  draft.reminderPhotoIds = null;
+  draft.reminderPhotoTemplateId = null;
+  draft.reminderPhotoSourceUrl = null;
+  draft.reminderPhotoSourceUrls = [];
+  draft.rejectedReminderPhotoSourceUrls = [];
+  draft.reminderPhotoCredits = [];
+  state.mode = choice === 'manual' ? 'manual_photos' : null;
+  markEdited();
+  await save();
+  return choice === 'manual' ? promptManualPhotos() : showDraft();
+}
 
 function createDraft(message) {
   const text = message.text || message.caption || '';
@@ -453,11 +490,12 @@ function createDraft(message) {
     videoId: message.video?.file_id || null,
     mainMediaType: message.video ? 'video' : message.photo?.length ? 'photo' : null,
     buttons: [],
-    matches, odds, sportIcon: sportIcon(text), imageSource: 'manual', manualReminderPhotoIds: [],
+    matches, odds, sportIcon: sportIcon(text), imageSource: 'internet', manualReminderPhotoIds: [],
     networkKeys: [firstNetwork],
     channelIds: NETWORKS[firstNetwork].filter(channel => allowed.has(channel)),
     remindersEnabled: true,
     reminderDeleteAfter: 30,
+    postDeleteAuto: true,
     editedAt: Date.now()
   };
   state.mode = null;
@@ -475,12 +513,12 @@ function prepareDraft(draft, postAt) {
       assertChannelsAllowed(channels);
     }
   } else assertChannelsAllowed(channels);
-  if (!postAt) throw new Error('Укажите время выхода рекламы через «Отложить»');
-  if (postButtons(draft).some(button => !BUTTON_URL.test(button.url))) throw new Error('Ссылка кнопки должна начинаться с https://t.me/');
+  if (!postAt) throw new Error('Укажите время выхода рекламы через «Ввести время»');
+  if (postButtons(draft).some(button => !isButtonUrl(button.url))) throw new Error('Укажите корректную ссылку HTTP или HTTPS');
   if (draft.remindersEnabled === false) return { captions: [], times: [], channels, templates: [] };
   if (!draft.matches?.length || !draft.odds) throw new Error('В тексте рекламы должны быть строка с матчем и коэффициент. Если бот не распознал их, используйте /matches и /odds');
   if (!draft.adEnd) throw new Error('Укажите конец размещения рекламы');
-  if (!postButtons(draft).length) throw new Error('Добавьте кнопку в формате СМОТРЕТЬ ПРОГНОЗ - https://t.me/...');
+  if (!primaryPostButton(draft)) throw new Error('Для напоминаний добавьте обычную кнопку или скрытое продолжение');
   const times = scheduleTimes(postAt, draft.adEnd, draft.reminderDeleteAfter, draft.postDeleteAfter).filter(at => at >= Date.now() + 60_000);
   if (!times.length) throw new Error('До конца рекламы не осталось будущих напоминаний');
   const templateSport = hasMixedMatchSports(draft.matches, draft.sourceText) ? 'mixed' : draft.sportIcon;
@@ -497,166 +535,264 @@ function prepareDraft(draft, postAt) {
 
 async function sendOriginal(chatId, draft) {
   const keyboard = postKeyboard(draft);
+  const content = originalContent(draft);
   if (draft.mainMediaType === 'video' && draft.videoId) return telegram('sendVideo', {
-    chat_id: chatId, video: draft.videoId, caption: draft.sourceText || undefined,
-    caption_entities: draft.sourceEntities?.length ? draft.sourceEntities : undefined,
+    chat_id: chatId, video: draft.videoId, caption: content.text || undefined,
+    caption_entities: content.entities.length ? content.entities : undefined,
     reply_markup: keyboard
   });
-  if (draft.photoId && draft.postManaged && draft.sourceText?.trim()) return telegram('sendRichMessage', { chat_id: chatId,
-    rich_message: richWithQuotedPhoto(entitiesToRichHtml(draft.sourceText, draft.sourceEntities), draft.photoId),
+  if (draft.photoId && draft.postManaged && content.text.trim()) return telegram('sendRichMessage', { chat_id: chatId,
+    rich_message: richWithQuotedPhoto(entitiesToRichHtml(content.text, content.entities), draft.photoId),
     reply_markup: keyboard });
   if (draft.photoId) return telegram('sendPhoto', { chat_id: chatId, photo: draft.photoId,
-    caption: draft.sourceText || undefined, caption_entities: draft.sourceEntities?.length ? draft.sourceEntities : undefined,
+    caption: content.text || undefined, caption_entities: content.entities.length ? content.entities : undefined,
     reply_markup: keyboard });
   return telegram('sendMessage', {
-    chat_id: chatId, text: draft.sourceText, entities: draft.sourceEntities?.length ? draft.sourceEntities : undefined,
+    chat_id: chatId, text: content.text, entities: content.entities.length ? content.entities : undefined,
     reply_markup: keyboard
   });
 }
 
-async function preview({ rerollInternetImages = false } = {}) {
-  const draft = state.draft;
-  if (!draft) throw new Error('Пришлите текст или фото для нового поста');
+async function preview({ rerollInternetImages = false, after = null, showMessages = true } = {}) {
+  const original = state.draft;
+  if (!original) throw new Error('Пришлите текст или фото для нового поста');
+  const userId = currentUserId();
+  if (!showMessages && !rerollInternetImages && !preparationQueue.hasCurrent(userId, original, original.editedAt)) {
+    const old = original.editingCampaignId && state.campaigns.find(c => c.id === original.editingCampaignId);
+    const live = old && campaignHasStarted(old, state.jobs);
+    const postAt = original.postAt || Date.now();
+    syncAutomaticPostDeletion(original, postAt);
+    if (refreshPreparedPreview(original, () => live && old.times?.length ? prepareLiveDraft(original, old) : prepareDraft(original, postAt), CARD_STYLE_VERSION)) {
+      await save();
+      return after?.();
+    }
+  }
+  const revision = original.editedAt;
+  const initialMode = state.mode;
+  const snapshot = structuredClone(original);
+  const isCurrent = () => rawState.userSessions[String(userId)]?.draft === original &&
+    original.editedAt === revision && rawState.userSessions[String(userId)]?.mode === initialMode;
+  const notice = await reply(showMessages
+    ? '⏳ Готовлю превью и картинки в фоне. Можно пользоваться меню; если изменить черновик, эта подготовка будет отменена.'
+    : '⏳ Подготавливаю изменённые картинки в фоне. Повторно отправлять всё превью не буду.');
+  state.draftInfoMessageIds ||= [];
+  state.draftInfoMessageIds.push(notice.message_id);
+  await save();
+  const sent = { info: [], preview: [] };
+  const removeNotice = async () => {
+    await telegram('deleteMessage', { chat_id: userId, message_id: notice.message_id }).catch(() => {});
+    state.draftInfoMessageIds = (state.draftInfoMessageIds || []).filter(id => id !== notice.message_id);
+    await save();
+  };
+  const job = preparationQueue.start(userId, {
+    identity: original, revision, variant: rerollInternetImages, isCurrent, after,
+    work: control => runForUser(userId, async () => {
+      const track = async (send, kind = 'preview') => {
+        control.assertCurrent();
+        const message = await send();
+        if (message?.message_id) sent[kind].push(message.message_id);
+        control.assertCurrent();
+        return message;
+      };
+      return preparePreview(snapshot, { rerollInternetImages, showMessages, control, track,
+        info: (text, extra = {}) => track(() => reply(text, extra), 'info') });
+    }),
+    finish: (prepared, control) => userActions.run(userId, () => runForUser(userId, async () => {
+      control.assertCurrent();
+      if (!showMessages) {
+        for (const id of sent.preview) await telegram('deleteMessage', { chat_id: userId, message_id: id }).catch(() => {});
+        sent.preview = [];
+      }
+      for (const [kind, key] of [['info', 'draftInfoMessageIds'], ['preview', 'draftPreviewMessageIds']]) {
+        state[key] = [...(state[key] || []), ...sent[kind]];
+      }
+      if (prepared) for (const key of ['postDeleteAfter', 'reminderPhotoCredits', 'rejectedReminderPhotoSourceUrls',
+        'reminderPhotoIds', 'reminderPhotoId', 'reminderPhotoSourceUrls', 'reminderPhotoSourceUrl',
+        'reminderPhotoMatch', 'reminderPhotoTemplateId', 'reminderPhotoStyleVersion', 'previewCaptions',
+        'selectedReminderTemplates', 'liveSchedulePreparation', 'previewedAt', 'autoPreviewAfterMetadataEdit']) {
+        if (Object.hasOwn(snapshot, key)) original[key] = snapshot[key];
+      }
+      control.commit();
+      await save();
+      await removeNotice();
+      if (prepared) {
+        if (control.hasAfter()) await control.after();
+        else if (!state.mode) await showDraft();
+      }
+    })),
+    dispose: () => runForUser(userId, async () => {
+      for (const id of [...sent.info, ...sent.preview]) await telegram('deleteMessage', { chat_id: userId, message_id: id }).catch(() => {});
+      await removeNotice();
+    }),
+    onError: error => userActions.run(userId, () => runForUser(userId, async () => {
+      if (isCurrent()) await replyError(error.message);
+    }))
+  });
+  if (job.reused) await removeNotice();
+}
+
+async function preparePreview(draft, { rerollInternetImages, showMessages = true, control, track, info }) {
+  control.assertCurrent();
   if (rerollInternetImages && (draft.imageSource !== 'internet' || draft.remindersEnabled === false)) {
     throw new Error('Перенайти можно только картинки из интернета для напоминаний');
   }
   const postAt = draft.postAt || Date.now();
+  syncAutomaticPostDeletion(draft, postAt);
   if (draft.remindersEnabled === false) {
-    prepareDraft(draft, postAt);
-    await replyDraftInfo(`Превью поста:\n${draftSummary(draft)}\nНапоминания выключены.`);
-    await trackPreviewMessage(await sendOriginal(currentUserId(), { ...draft, postManaged: true }));
-    draft.previewedAt = Date.now();
-    await save();
-    return showDraft();
+    const prepared = prepareDraft(draft, postAt);
+    if (showMessages) {
+      await info(`Превью поста:\n${draftSummary(draft)}\nНапоминания выключены.`);
+      await track(() => sendOriginal(currentUserId(), { ...draft, postManaged: true }));
+    }
+    finishPreviewPreparation(draft, prepared);
+    return true;
   }
   const old = draft.editingCampaignId && state.campaigns.find(c => c.id === draft.editingCampaignId);
-  const live = old && state.jobs.some(j => j.campaignId === old.id && ['sent', 'published', 'deleted'].includes(j.status));
+  const live = old && campaignHasStarted(old, state.jobs);
   const sample = draft.adEnd ? draft : { ...draft, adEnd: postAt + (30 + (draft.reminderDeleteAfter ?? 30)) * MINUTE };
   const { captions, times, templates } = live ? prepareLiveDraft(draft, old) : prepareDraft(sample, postAt);
   const match = draft.matches[0];
   const sourceKey = reminderImageSourceKey(draft);
-  const photoCacheValid = !rerollInternetImages && draft.reminderPhotoIds?.length === captions.length &&
-    draft.reminderPhotoIds.every(Boolean) && draft.reminderPhotoMatch === match &&
-    draft.reminderPhotoTemplateId === sourceKey && draft.reminderPhotoStyleVersion === CARD_STYLE_VERSION;
+  const photoCacheValid = !rerollInternetImages && preparedPhotosAreCurrent(draft, captions.length, CARD_STYLE_VERSION);
+  const retainedPhotos = !photoCacheValid && !rerollInternetImages && live ? retainedLivePhotos(draft, old, captions.length) : [];
+  const prefixCount = retainedPhotos.length;
+  const retainedUrls = Array.from({ length: prefixCount }, (_, index) => draft.reminderPhotoSourceUrls?.[index] || null);
   let internetImages = null;
   let manualImages = null;
   if (!photoCacheValid) {
     if (draft.imageSource === 'internet') {
       try {
-        const excludedSourceUrls = rerollInternetImages
-          ? [...new Set([...(draft.rejectedReminderPhotoSourceUrls || []), ...(draft.reminderPhotoSourceUrls || [])])]
-          : [];
-        const found = await getInternetMatchBackgrounds(match, sportIconForMatch(match, draft.sportIcon, draft.sourceText), captions.length, {
+        const excludedSourceUrls = [...new Set([...(draft.rejectedReminderPhotoSourceUrls || []), ...retainedUrls,
+          ...(rerollInternetImages ? draft.reminderPhotoSourceUrls || [] : [])].filter(Boolean))];
+        const needed = captions.length - prefixCount;
+        const found = await getInternetMatchBackgrounds(match, sportIconForMatch(match, draft.sportIcon, draft.sourceText), needed, {
           context: draft.sourceText,
+          checkActive: () => control.assertCurrent(),
           excludedSourceUrls,
           fallbackMatches: draft.matches.slice(1).map(other => ({
             match: other, sportIcon: sportIconForMatch(other, draft.sportIcon, draft.sourceText)
           }))
         });
-        internetImages = repeatAtMostTwice(found, captions.length);
+        internetImages = [...Array(prefixCount).fill(null), ...repeatAtMostTwice(found, needed)];
       } catch (error) {
-        return replyDraftInfo(`${error.message}\n\nМожно загрузить свои фото в этот черновик — от одного до ${captions.length}.`, {
+        if (error.backgroundCanceled) throw error;
+        await info(`${error.message}\n\nМожно загрузить свои фото в этот черновик — от одного до ${captions.length}.`, {
           reply_markup: { inline_keyboard: [
             [{ text: '📤 Загрузить свои фото', callback_data: 'source:manual' }],
             [{ text: '← К черновику', callback_data: 'nav:back' }]
           ] }
         });
+        return false;
       }
     } else if (draft.imageSource === 'manual') {
-      if (!draft.manualReminderPhotoIds?.length) return replyDraftInfo('Для предпросмотра напоминаний сначала загрузите хотя бы одно своё фото.', {
+      if (!draft.manualReminderPhotoIds?.length) {
+        await info('Для предпросмотра напоминаний сначала загрузите хотя бы одно своё фото.', {
         reply_markup: { inline_keyboard: [
           [{ text: '📤 Загрузить свои фото', callback_data: 'source:manual' }],
           [{ text: '← К черновику', callback_data: 'nav:back' }]
         ] }
-      });
+        });
+        return false;
+      }
       manualImages = distributeManualPhotos(draft.manualReminderPhotoIds, captions.length);
     } else throw new Error('Выберите свои фото или поиск в интернете');
   }
-  await replyDraftInfo(`Превью рекламы и напоминания:\n${draftSummary(draft)}${draft.postAt && draft.adEnd ? `\nНапоминаний: ${times.length}; первое ${formatMoscow(times[0])} МСК` : '\nРасписание задаётся через «Отложить».'}`);
-  if (draft.photoId) await trackPreviewMessage(await telegram('sendRichMessage', { chat_id: currentUserId(),
-    rich_message: richWithQuotedPhoto(entitiesToRichHtml(draft.sourceText, draft.sourceEntities), draft.photoId),
-    reply_markup: postKeyboard(draft) }));
-  else await trackPreviewMessage(await telegram('sendMessage', { chat_id: currentUserId(), text: draft.sourceText,
-    entities: draft.sourceEntities?.length ? draft.sourceEntities : undefined, reply_markup: postKeyboard(draft) }));
-  const button = postButtons(draft)[0];
+  if (showMessages) {
+    await info(`Превью рекламы и напоминания:\n${draftSummary(draft)}${draft.postAt && draft.adEnd ? `\nНапоминаний: ${times.length}; первое ${formatMoscow(times[0])} МСК` : '\nРасписание задаётся через «Ввести время».'}`);
+    await track(() => sendOriginal(currentUserId(), { ...draft, postManaged: true }));
+  }
+  const button = primaryPostButton(draft);
   const photoIds = photoCacheValid ? [...draft.reminderPhotoIds] : manualImages ? [...manualImages] : [];
+  if (prefixCount) for (let index = 0; index < prefixCount; index++) photoIds[index] = retainedPhotos[index];
   const previewCaption = index => reminderCaptionFor({ ...draft, captions,
-    reminderPhotoCredits: photoCacheValid ? draft.reminderPhotoCredits : [] }, index);
+    reminderPhotoCredits: photoCacheValid || prefixCount ? draft.reminderPhotoCredits : [] }, index);
   const photoIdBySource = new Map();
   for (let index = 0; index < captions.length; index++) {
+    control.assertCurrent();
+    let uploaded = false;
     let photoId = photoIds[index];
     if (!photoId && internetImages?.[index]) photoId = photoIdBySource.get(internetImages[index].sourceUrl);
-    if (photoId) await trackPreviewMessage(await telegram('sendRichMessage', { chat_id: currentUserId(),
-      rich_message: reminderRichMessage(previewCaption(index), photoId),
-      reply_markup: { inline_keyboard: [[button]] } }));
-    else {
+    if (photoId) {
+      if (showMessages) await track(() => telegram('sendRichMessage', { chat_id: currentUserId(),
+        rich_message: reminderRichMessage(previewCaption(index), photoId),
+        reply_markup: { inline_keyboard: [[button]] } }));
+    } else {
       const png = internetImages?.[index]?.image;
       if (!png) throw new Error('Картинка для напоминания не подготовлена');
-      const sent = await sendGeneratedRichPhoto(currentUserId(), png, previewCaption(index), button);
-      await trackPreviewMessage(sent);
+      const sent = await track(() => sendGeneratedRichPhoto(currentUserId(), png, previewCaption(index), button));
+      uploaded = true;
       photoId = richPhotoFileId(sent);
       if (!photoId) throw new Error('Telegram не вернул ID картинки напоминания');
       if (internetImages) photoIdBySource.set(internetImages[index].sourceUrl, photoId);
     }
     photoIds[index] = photoId;
-    if (index + 1 < captions.length) await new Promise(resolve => setTimeout(resolve, 1050));
+    if ((showMessages || uploaded) && index + 1 < captions.length) await new Promise(resolve => setTimeout(resolve, 1050));
   }
   if (!photoCacheValid) {
-    draft.reminderPhotoCredits = [];
+    draft.reminderPhotoCredits = prefixCount ? (draft.reminderPhotoCredits || []).slice(0, prefixCount) : [];
     if (rerollInternetImages) draft.rejectedReminderPhotoSourceUrls = [...new Set([
       ...(draft.rejectedReminderPhotoSourceUrls || []), ...(draft.reminderPhotoSourceUrls || [])
     ])].slice(-200);
     draft.reminderPhotoIds = photoIds;
     draft.reminderPhotoId = photoIds[0];
-    draft.reminderPhotoSourceUrls = internetImages?.map(item => item.sourceUrl) || [];
-    draft.reminderPhotoSourceUrl = internetImages?.[0]?.sourceUrl || null;
+    draft.reminderPhotoSourceUrls = internetImages ? [...retainedUrls, ...internetImages.slice(prefixCount).map(item => item.sourceUrl)] : [];
+    draft.reminderPhotoSourceUrl = draft.reminderPhotoSourceUrls[0] || null;
     draft.reminderPhotoMatch = match;
     draft.reminderPhotoTemplateId = sourceKey;
     draft.reminderPhotoStyleVersion = CARD_STYLE_VERSION;
   }
-  draft.previewCaptions = captions;
-  draft.selectedReminderTemplates = templates;
-  draft.previewedAt = Date.now();
-  await save();
-  await showDraft();
+  finishPreviewPreparation(draft, { captions, templates });
+  control.assertCurrent();
+  return true;
 }
 
 function prepareLiveDraft(draft, old) {
   const channels = selectedChannels(draft);
   assertCampaignAccess(old);
   if (JSON.stringify([...channels].sort()) !== JSON.stringify([...old.channelIds].sort())) throw new Error('После выхода поста состав каналов менять нельзя');
-  if (draft.postAt !== old.postAt || draft.adEnd !== old.adEnd) throw new Error('Время рекламы нельзя изменить после выхода напоминания');
   if (!draft.sourceText) throw new Error('Пришлите текст рекламы');
-  if (postButtons(draft).some(button => !BUTTON_URL.test(button.url))) throw new Error('Проверьте ссылки кнопок');
-  if (!draft.matches?.length || !draft.odds || !postButtons(draft).length) throw new Error('Для напоминаний нужны матч, коэффициент и кнопка');
+  if (postButtons(draft).some(button => !isButtonUrl(button.url))) throw new Error('Проверьте ссылки кнопок');
+  if (!draft.matches?.length || !draft.odds || !primaryPostButton(draft)) throw new Error('Для напоминаний нужны матч, коэффициент и кнопка');
+  const key = createHash('sha256').update(JSON.stringify([draft.editedAt, old.times, old.adEnd, old.version, old.reminderOverrides])).digest('hex');
+  if (draft.liveSchedulePreparation?.key !== key) draft.liveSchedulePreparation = { key, now: Date.now() };
+  const schedule = planLiveSchedule(old, state.jobs, draft, draft.liveSchedulePreparation.now);
   const templateSport = hasMixedMatchSports(draft.matches, draft.sourceText) ? 'mixed' : draft.sportIcon;
-  const templates = (old.templates || []).every(template => compatibleReminderTemplates([template], templateSport).length)
-    ? old.templates || []
-    : selectReminderTemplates(compatibleReminderTemplates(state.templates, templateSport), old.times.length,
-      template => renderTemplate(template, draft)).map(item => item.template);
+  const compatible = templates => templates?.every(template => compatibleReminderTemplates([template], templateSport).length);
+  const pool = compatibleReminderTemplates(state.templates, templateSport);
+  const cachedPrefix = draft.selectedReminderTemplates?.slice(0, old.times.length);
+  const existing = old.templates?.length === old.times.length && compatible(old.templates) ? old.templates :
+    cachedPrefix?.length === old.times.length && compatible(cachedPrefix) ? cachedPrefix :
+      selectReminderTemplates(pool, old.times.length, template => renderTemplate(template, draft)).map(item => item.template);
+  const cached = draft.selectedReminderTemplates;
+  const templates = cached?.length === schedule.times.length && compatible(cached) &&
+    JSON.stringify(cached.slice(0, existing.length)) === JSON.stringify(existing) ? cached :
+    extendReminderTemplates(existing, pool, schedule.times.length, template => renderTemplate(template, draft));
   const captions = templates.map(template => renderTemplate(template, draft));
-  if (captions.length !== old.times.length) throw new Error('Не найдены шаблоны исходной серии');
+  if (captions.length !== schedule.times.length) throw new Error('Не найдены шаблоны серии');
   validateCaptionRepetitions(captions);
   if (captions.some(c => c.length > (old.messageFormat === 'rich' ? 32768 : 1024))) throw new Error('Текст напоминания слишком длинный');
-  return { captions, times: old.times, channels, templates };
+  return { captions, times: schedule.times, channels, templates, schedule };
 }
 
 async function syncPublishedJob(job, campaign) {
+  if (!CONFIGURED_CHANNELS.includes(String(job.chatId))) return;
+  if (job.kind === 'post' && campaign.postRemoved) return;
   if (!['sent', 'published'].includes(job.status) || !job.messageId || (job.syncedVersion ?? 1) >= (campaign.version || 1)) return;
   const address = { chat_id: job.chatId, message_id: job.messageId };
   try {
     if (job.kind === 'post') {
       const currentMedia = campaign.mainMediaType === 'video' ? campaign.videoId : campaign.photoId;
+      const content = originalContent(campaign);
       if (campaign.postManaged && campaign.photoId) await telegram('editMessageText', { ...address,
-        rich_message: richWithQuotedPhoto(entitiesToRichHtml(campaign.sourceText, campaign.sourceEntities), campaign.photoId),
+        rich_message: richWithQuotedPhoto(entitiesToRichHtml(content.text, content.entities), campaign.photoId),
         reply_markup: postKeyboard(campaign) || { inline_keyboard: [] } });
-      else if (!campaign.mainMediaType) await telegram('editMessageText', { ...address, text: campaign.sourceText,
-        entities: campaign.sourceEntities?.length ? campaign.sourceEntities : undefined, reply_markup: postKeyboard(campaign) || { inline_keyboard: [] } });
+      else if (!campaign.mainMediaType) await telegram('editMessageText', { ...address, text: content.text,
+        entities: content.entities.length ? content.entities : undefined, reply_markup: postKeyboard(campaign) || { inline_keyboard: [] } });
       else if (job.mediaId !== currentMedia) await telegram('editMessageMedia', { ...address,
-        media: { type: campaign.mainMediaType, media: currentMedia, caption: campaign.sourceText || '',
-          caption_entities: campaign.sourceEntities?.length ? campaign.sourceEntities : undefined }, reply_markup: postKeyboard(campaign) || { inline_keyboard: [] } });
-      else await telegram('editMessageCaption', { ...address, caption: campaign.sourceText || '',
-        caption_entities: campaign.sourceEntities?.length ? campaign.sourceEntities : undefined, reply_markup: postKeyboard(campaign) || { inline_keyboard: [] } });
+        media: { type: campaign.mainMediaType, media: currentMedia, caption: content.text || '',
+          caption_entities: content.entities.length ? content.entities : undefined }, reply_markup: postKeyboard(campaign) || { inline_keyboard: [] } });
+      else await telegram('editMessageCaption', { ...address, caption: content.text || '',
+        caption_entities: content.entities.length ? content.entities : undefined, reply_markup: postKeyboard(campaign) || { inline_keyboard: [] } });
       job.mediaId = currentMedia || null;
     } else {
       const keyboard = { inline_keyboard: [[reminderButtonFor(campaign, job.index)]] };
@@ -689,16 +825,24 @@ async function saveCampaignEdits() {
   if (!campaign) throw new Error('Исходный пост не найден');
   assertCampaignAccess(campaign);
   const jobs = state.jobs.filter(j => j.campaignId === campaign.id);
-  const live = jobs.some(j => ['sent', 'published', 'deleted'].includes(j.status));
+  const live = campaignHasStarted(campaign, jobs);
+  if (!previewIsCurrent(draft)) {
+    return preview({ after: () => saveCampaignEdits(), showMessages: false });
+  }
   if (!live) return publish('plan');
   if (!campaign.times?.length && (draft.postAt !== campaign.postAt || JSON.stringify(selectedChannels(draft).sort()) !== JSON.stringify([...campaign.channelIds].sort()))) {
     throw new Error('После публикации поста нельзя менять его время и состав каналов');
   }
-  const { captions, templates } = campaign.times?.length ? prepareLiveDraft(draft, campaign) : prepareDraft(draft, campaign.postAt);
+  const { captions, templates, schedule } = campaign.times?.length ? prepareLiveDraft(draft, campaign) : prepareDraft(draft, campaign.postAt);
   const buttons = postButtons(draft);
-  const contentChanged = JSON.stringify([campaign.sourceText, campaign.photoId, campaign.reminderPhotoIds, campaign.reminderPhotoId, campaign.reminderPhotoCredits, postButtons(campaign), campaign.captions]) !==
-    JSON.stringify([draft.sourceText, draft.photoId, draft.reminderPhotoIds, draft.reminderPhotoId, draft.reminderPhotoCredits, buttons, captions]);
-  if (contentChanged && (!draft.previewedAt || draft.previewedAt < draft.editedAt || JSON.stringify(captions) !== JSON.stringify(draft.previewCaptions))) throw new Error('Сначала нажмите «Предпросмотр»');
+  const growing = schedule && schedule.times.length > campaign.times.length;
+  const contentChanged = JSON.stringify([campaign.sourceText, campaign.sourceEntities, campaign.buttonMode, campaign.hiddenContinuation, campaign.photoId, campaign.reminderPhotoIds, campaign.reminderPhotoId, campaign.reminderPhotoCredits, postButtons(campaign), campaign.captions]) !==
+    JSON.stringify([draft.sourceText, draft.sourceEntities, draft.buttonMode, draft.hiddenContinuation, draft.photoId,
+      growing && campaign.reminderPhotoIds ? draft.reminderPhotoIds?.slice(0, campaign.reminderPhotoIds.length) : draft.reminderPhotoIds,
+      draft.reminderPhotoId, growing && campaign.reminderPhotoCredits ? draft.reminderPhotoCredits?.slice(0, campaign.reminderPhotoCredits.length) : draft.reminderPhotoCredits,
+      buttons, growing ? captions.slice(0, campaign.captions.length) : captions]);
+  if ((contentChanged || growing) && (!draft.previewedAt || draft.previewedAt < draft.editedAt || JSON.stringify(captions) !== JSON.stringify(draft.previewCaptions))) throw new Error('Сначала нажмите «Предпросмотр»');
+  if (growing && !preparedPhotosAreCurrent(draft, captions.length, CARD_STYLE_VERSION)) throw new Error('Не подготовлены картинки дополнительных напоминаний. Повторите сохранение.');
   Object.assign(campaign, { sourceText: draft.sourceText, sourceEntities: draft.sourceEntities || [], photoId: draft.photoId,
     reminderPhotoId: draft.reminderPhotoId, reminderPhotoIds: draft.reminderPhotoIds,
     reminderPhotoCredits: draft.reminderPhotoCredits || [],
@@ -706,10 +850,12 @@ async function saveCampaignEdits() {
     reminderPhotoTemplateId: draft.reminderPhotoTemplateId, reminderPhotoStyleVersion: draft.reminderPhotoStyleVersion,
     imageSource: draft.imageSource || 'manual', manualReminderPhotoIds: draft.manualReminderPhotoIds || [],
     reminderPhotoSourceUrl: draft.reminderPhotoSourceUrl || null,
-    videoId: draft.videoId, buttons, url: buttons[0]?.url || null, buttonText: buttons[0]?.text || 'ПРОГНОЗ',
+    videoId: draft.videoId, buttons, buttonMode: draft.buttonMode || 'regular', hiddenContinuation: draft.hiddenContinuation || null, url: buttons[0]?.url || null, buttonText: buttons[0]?.text || 'ПРОГНОЗ',
     matches: draft.matches, odds: draft.odds, captions, templates,
-    reminderDeleteAfter: draft.reminderDeleteAfter === undefined ? 30 : draft.reminderDeleteAfter, postDeleteAfter: draft.postDeleteAfter ?? null });
+    reminderDeleteAfter: draft.reminderDeleteAfter === undefined ? 30 : draft.reminderDeleteAfter,
+    postDeleteAfter: draft.postDeleteAfter ?? null, postDeleteAuto: draft.postDeleteAuto === true });
   if (contentChanged) campaign.version = (campaign.version || 1) + 1;
+  const scheduleResult = schedule ? applyLiveSchedule(campaign, state.jobs, schedule) : { remindersAdded: 0 };
   setPostDeleteAfter(campaign, jobs, campaign.postDeleteAfter);
   for (const job of jobs) {
     if (job.kind !== 'reminder' || reminderIsRemoved(campaign, job.index) || !['sent', 'published'].includes(job.status)) continue;
@@ -724,26 +870,31 @@ async function saveCampaignEdits() {
   await clearPreviewMessages();
   if (contentChanged) for (const job of jobs) await syncPublishedJob(job, campaign);
   const failures = jobs.filter(j => j.syncError && ['sent', 'published'].includes(j.status));
-  await briefNotice(`Изменения поста ${campaign.id} сохранены для ${campaign.channelIds.length} каналов.${failures.length ? ` Не удалось сразу обновить ${failures.length} сообщений; повторю автоматически. Ошибка: ${failures[0].syncError}` : ''}`, { reply_markup: MENU });
+  await briefNotice(`Изменения серии ${campaign.id} сохранены для ${campaign.channelIds.length} каналов.${scheduleResult.remindersAdded ? ` Добавлено напоминаний на канал: ${scheduleResult.remindersAdded}.` : ''}${failures.length ? ` Не удалось сразу обновить ${failures.length} сообщений; повторю автоматически. Ошибка: ${failures[0].syncError}` : ''}`, { reply_markup: MENU });
   if (state.planDay) await showSavedContentPlan();
 }
 
 async function publish(mode = 'plan') {
   const draft = state.draft;
   if (!draft) throw new Error('Нет черновика напоминаний');
+  if (mode === 'reminders_only' && draft.remindersEnabled === false) throw new Error('Включите напоминания, чтобы отложить их без поста');
+  if (shouldPreparePreview(draft) || preparationQueue.hasCurrent(currentUserId(), draft, draft.editedAt)) {
+    return preview({ after: () => publish(mode), showMessages: false });
+  }
   const postAt = mode === 'now' ? Date.now() : draft.postAt;
+  syncAutomaticPostDeletion(draft, postAt);
   const { captions, times, channels, templates } = prepareDraft(draft, postAt);
   await validateChannelAccess(channels);
   if (draft.remindersEnabled !== false) {
     if (!draft.previewedAt || draft.previewedAt < draft.editedAt) throw new Error('Сначала нажмите «Превью» после ввода времени');
     if (JSON.stringify(captions) !== JSON.stringify(draft.previewCaptions)) throw new Error('Шаблоны изменились после предпросмотра. Повторите /preview');
-    if (draft.reminderPhotoIds?.length !== captions.length || !draft.reminderPhotoIds.every(Boolean) || draft.reminderPhotoMatch !== draft.matches[0] || draft.reminderPhotoTemplateId !== reminderImageSourceKey(draft) || draft.reminderPhotoStyleVersion !== CARD_STYLE_VERSION) throw new Error('Сначала нажмите «Превью», чтобы подготовить картинки всех напоминаний');
+    if (!preparedPhotosAreCurrent(draft, captions.length, CARD_STYLE_VERSION)) throw new Error('Сначала нажмите «Превью», чтобы подготовить картинки всех напоминаний');
   }
   const id = String(Date.now());
   const editingId = draft.editingCampaignId;
   const previousCampaign = editingId ? state.campaigns.find(c => c.id === editingId) : null;
   if (editingId) assertCampaignAccess(previousCampaign);
-  const postManaged = editingId ? previousCampaign?.postManaged === true : true;
+  const postManaged = editingId ? previousCampaign?.postManaged === true : mode !== 'reminders_only';
   if (postManaged && mode !== 'now' && postAt < Date.now() + MINUTE) throw new Error('Время выхода рекламы должно быть хотя бы через минуту. Измените его и повторите предпросмотр.');
   if (editingId) {
     const oldJobs = state.jobs.filter(j => j.campaignId === editingId);
@@ -765,7 +916,10 @@ async function publish(mode = 'plan') {
     videoId: draft.videoId,
     imageSource: draft.imageSource || 'manual', manualReminderPhotoIds: draft.manualReminderPhotoIds || [],
     mainMediaType: draft.mainMediaType, networkKeys: draft.networkKeys, channelIds: channels, postManaged,
-    postAt, postDeleteAfter: draft.postDeleteAfter || null, buttons: postButtons(draft),
+    remindersOnly: editingId ? previousCampaign?.remindersOnly === true : mode === 'reminders_only',
+    postRemoved: previousCampaign?.postRemoved === true,
+    postAt, postDeleteAfter: draft.postDeleteAfter ?? null, postDeleteAuto: draft.postDeleteAuto === true,
+    buttons: postButtons(draft), buttonMode: draft.buttonMode || 'regular', hiddenContinuation: draft.hiddenContinuation || null,
     url: primaryButton?.url || null, buttonText: primaryButton?.text || 'ПРОГНОЗ', remindersEnabled: draft.remindersEnabled,
     adEnd: draft.adEnd || null, reminderDeleteAfter: draft.reminderDeleteAfter === undefined ? 30 : draft.reminderDeleteAfter, captions, times, templates,
     reminderOverrides,
@@ -780,7 +934,7 @@ async function publish(mode = 'plan') {
   if (mode === 'now') await processJobs(finalId);
   const postJobs = state.jobs.filter(job => job.campaignId === finalId && job.kind === 'post');
   const posted = mode === 'now' && postJobs.every(job => ['sent', 'published', 'deleted'].includes(job.status));
-  await briefNotice(`${mode === 'now' ? posted ? 'Пост опубликован' : 'Пост поставлен на немедленную публикацию' : captions.length ? 'Серия отложена' : 'Пост отложен'}: ${formatMoscow(postAt)} МСК.${captions.length ? ` Напоминаний на канал: ${captions.length}, первое ${formatMoscow(times[0])} МСК.` : ' Без напоминаний.'} Каналов: ${channels.length}.`, { reply_markup: MENU });
+  await briefNotice(`${mode === 'reminders_only' ? 'Напоминания отложены без поста' : mode === 'now' ? posted ? 'Пост опубликован' : 'Пост поставлен на немедленную публикацию' : captions.length ? 'Серия отложена' : 'Пост отложен'}: ${formatMoscow(postAt)} МСК.${captions.length ? ` Напоминаний на канал: ${captions.length}, первое ${formatMoscow(times[0])} МСК.` : ' Без напоминаний.'} Каналов: ${channels.length}.`, { reply_markup: MENU });
   if (editingId && state.planDay) await showSavedContentPlan();
 }
 
@@ -871,6 +1025,8 @@ async function showPlanItem(id, item) {
     reply_markup: { inline_keyboard: [
       ...(ad ? [[{ text: campaign.times?.length ? '✏️ Изменить серию' : '✏️ Изменить пост', callback_data: `plan:edit:${id}` }, { text: '🕓 Перенести', callback_data: `plan:move:${id}` }]] :
         [[{ text: '✏️ Изменить это напоминание', callback_data: `rem:edit:${id}:${index}` }]]),
+      ...(!ad && campaign.remindersOnly ? [[{ text: '✏️ Изменить серию', callback_data: `plan:edit:${id}` }, { text: '🕓 Перенести серию', callback_data: `plan:move:${id}` }],
+        [{ text: '🗑 Удалить серию', callback_data: `plan:delete:${id}` }]] : []),
       ...(ad && campaign.postManaged && jobs.some(job => ['pending', 'sent', 'published'].includes(job.status)) ?
         [[{ text: `⏱ Удаление поста: ${campaign.postDeleteAfter ? deletionLabel(campaign.postDeleteAfter) : 'не удалять'}`, callback_data: `post:delete:${id}` }]] : []),
       ...(ad && campaign.postManaged && state.jobs.filter(job => job.campaignId === id).every(job => ['pending', 'canceled'].includes(job.status)) ?
@@ -1009,7 +1165,7 @@ async function showCampaign(id) {
 }
 
 function draftFromCampaign(campaign, editing = false) {
-  return { sourceText: campaign.sourceText, sourceEntities: campaign.sourceEntities || [],
+  return migratePreparedPhotoKey({ sourceText: campaign.sourceText, sourceEntities: campaign.sourceEntities || [],
     photoId: campaign.photoId, reminderPhotoId: campaign.reminderPhotoId,
     reminderPhotoCredits: campaign.reminderPhotoCredits || [],
     reminderPhotoIds: campaign.reminderPhotoIds, reminderPhotoSourceUrls: campaign.reminderPhotoSourceUrls || [],
@@ -1021,10 +1177,13 @@ function draftFromCampaign(campaign, editing = false) {
     matches: campaign.matches || [], odds: campaign.odds,
     sportIcon: sportIcon(campaign.sourceText || ''), networkKeys: campaign.networkKeys || [NETWORKS['1'].length ? '1' : '2'],
     channelIds: campaign.channelIds || [...new Set((campaign.networkKeys || []).flatMap(key => NETWORKS[key] || []))],
-    postAt: editing ? campaign.postAt : null, postDeleteAfter: campaign.postDeleteAfter, url: campaign.url,
-    buttonText: campaign.buttonText, buttons: [...postButtons(campaign)], remindersEnabled: campaign.remindersEnabled,
+    postAt: editing ? campaign.postAt : null, postDeleteAfter: campaign.postDeleteAfter,
+    postDeleteAuto: campaign.postDeleteAuto === true, url: campaign.url,
+    buttonText: campaign.buttonText, buttons: [...postButtons(campaign)], buttonMode: campaign.buttonMode || 'regular',
+    hiddenContinuation: structuredClone(campaign.hiddenContinuation || null), remindersEnabled: campaign.remindersEnabled,
     adEnd: editing ? campaign.adEnd : null, reminderDeleteAfter: campaign.reminderDeleteAfter === undefined ? 30 : campaign.reminderDeleteAfter,
-    editingCampaignId: editing ? campaign.id : null, editedAt: Date.now() };
+    selectedReminderTemplates: campaign.templates || [],
+    editingCampaignId: editing ? campaign.id : null, editedAt: Date.now() });
 }
 
 async function cancelCampaign(id) {
@@ -1046,6 +1205,15 @@ async function promptMode(mode, prompt, extra = {}) {
   state.mode = mode;
   await save();
   await sendPrompt(prompt, extra);
+}
+
+function buttonTypeKeyboard(hidden = false) {
+  return { inline_keyboard: [
+    [{ text: `${hidden ? '' : '✅ '}Обычная кнопка`, callback_data: 'edit:button_regular' },
+      { text: `${hidden ? '✅ ' : ''}Скрытое продолжение`, callback_data: 'edit:button_continuation' }],
+    [{ text: '🗑 Убрать кнопку / продолжение', callback_data: 'edit:clear_buttons' }],
+    [{ text: '← К посту', callback_data: 'nav:back' }]
+  ] };
 }
 
 async function showCopyChannels() {
@@ -1133,18 +1301,7 @@ async function handleCallback(callback) {
     if (!state.draft) throw new Error('Сначала создайте черновик');
     const choice = data.slice('source:'.length);
     if (!['internet', 'manual'].includes(choice)) throw new Error('Генерация изображений отключена. Выберите свои фото или поиск в интернете');
-    state.draft.imageSource = choice;
-    state.draft.reminderPhotoId = null;
-    state.draft.reminderPhotoIds = null;
-    state.draft.reminderPhotoTemplateId = null;
-    state.draft.reminderPhotoSourceUrl = null;
-    state.draft.reminderPhotoSourceUrls = [];
-    state.draft.rejectedReminderPhotoSourceUrls = [];
-    state.draft.reminderPhotoCredits = [];
-    state.mode = choice === 'manual' ? 'manual_photos' : null;
-    markEdited();
-    await save();
-    return choice === 'manual' ? promptManualPhotos() : showDraft();
+    return selectDraftImageSource(choice);
   }
   if (data.startsWith('manual:')) {
     if (!state.draft || state.draft.imageSource !== 'manual') throw new Error('Черновик со своими фото не найден');
@@ -1196,10 +1353,16 @@ async function handleCallback(callback) {
     const reminder = data.startsWith('reminder_delete:');
     const raw = data.slice(data.indexOf(':') + 1);
     if (raw === 'custom') return sendPrompt('Пришлите время удаления: 0 15, 1 30, 6 или 10. Можно указать любой интервал до 47 59 либо отправить «нет».');
-    if (reminder) state.draft.reminderDeleteAfter = raw === 'none' ? null : parseDurationMinutes(raw);
-    else state.draft.postDeleteAfter = raw === 'none' ? null : parseDurationMinutes(raw);
+    const previous = reminder ? state.draft.reminderDeleteAfter : state.draft.postDeleteAfter;
+    const wasAutomatic = state.draft.postDeleteAuto === true;
+    const minutes = raw === 'none' ? null : parseDurationMinutes(raw);
+    if (reminder) state.draft.reminderDeleteAfter = minutes;
+    else {
+      state.draft.postDeleteAfter = minutes;
+      state.draft.postDeleteAuto = false;
+    }
     state.mode = null;
-    markEdited();
+    if (previous !== minutes || (!reminder && wasAutomatic)) markEdited(previous != null);
     await save();
     return showDraft();
   }
@@ -1213,6 +1376,7 @@ async function handleCallback(callback) {
     const jobs = state.jobs.filter(job => job.campaignId === id && job.kind === 'post');
     if (!jobs.some(job => ['pending', 'sent', 'published'].includes(job.status))) throw new Error('Удаление этого поста уже нельзя изменить');
     setPostDeleteAfter(original, jobs, minutes);
+    original.postDeleteAuto = false;
     state.mode = null;
     state.modeCampaignId = null;
     await save();
@@ -1229,7 +1393,7 @@ async function handleCallback(callback) {
     state.mode = null;
     state.editReminder = null;
     await save();
-    return showPlanItem(id, String(index));
+    return showReminderEditor(id, index);
   }
   if (data === 'button:add') return promptMode('button', 'Пришлите: ТЕКСТ КНОПКИ | https://t.me/ссылка\nНапример: ПРОГНОЗ | https://t.me/+...');
   if (data.startsWith('button:remove:')) {
@@ -1334,6 +1498,19 @@ async function handleCallback(callback) {
     if (action === 'now') return publishItemCopy(true);
     throw new Error('Неизвестное действие с копией');
   }
+  if (data.startsWith('post:remove_only:') || data.startsWith('post:confirm_remove_only:')) {
+    const [, action, id] = data.split(':');
+    const campaign = writableCampaign(id);
+    if (!campaign.postManaged || campaign.postRemoved) throw new Error('Рекламный пост уже удалён или не публикуется этим ботом');
+    if (action === 'remove_only') return reply('Удалить только рекламный пост во всех каналах этой серии? Будущая публикация поста будет отменена, опубликованные копии — удалены. Напоминания сохранят расписание и продолжат выходить.', {
+      reply_markup: { inline_keyboard: [[{ text: '🗑 Да, удалить только пост', callback_data: `post:confirm_remove_only:${id}` }],
+        [{ text: '← Назад к редактированию', callback_data: 'nav:back' }]] }
+    });
+    const result = removeCampaignPost(campaign, state.jobs);
+    await save();
+    await briefNotice(`Рекламный пост отменён в очереди: ${result.canceled}; копий поставлено на удаление: ${result.deleting}. Напоминания продолжат выходить.${result.uncertain ? ` Для ${result.uncertain} копий отправка ещё не завершена или результат неизвестен. Успешно отправленные копии будут удалены; неизвестный результат проверьте в каналах вручную.` : ''}`);
+    return state.draft?.editingCampaignId === id ? showDraft() : showSavedContentPlan();
+  }
   if (data.startsWith('post:delete:')) {
     const id = data.slice('post:delete:'.length);
     const visible = visibleCampaign(id, true);
@@ -1425,7 +1602,7 @@ async function handleCallback(callback) {
     }
     if (action === 'move') {
       const jobs = state.jobs.filter(j => j.campaignId === id);
-      if (jobs.some(j => !['pending', 'canceled'].includes(j.status))) throw new Error('Перенести можно только серию, которая ещё не начала выходить');
+      if (campaignHasStarted(campaign, jobs) || jobs.some(j => !['pending', 'canceled'].includes(j.status))) throw new Error('Начало уже запущенной серии перенести нельзя. Откройте «Изменить серию» → «Конец рекламы».');
       const scoped = await writableCampaign(id);
       state.mode = 'reschedule';
       state.modeCampaignId = scoped.id;
@@ -1440,20 +1617,14 @@ async function handleCallback(callback) {
   if (action === 'media') return promptMode('add_media', 'Пришлите одно фото. Я прикреплю его к черновику рекламы; карточку напоминания создам отдельно по названию матча.', {
     reply_markup: { inline_keyboard: [[{ text: '← К посту без медиа', callback_data: 'nav:back' }]] }
   });
-  if (action === 'image_source') return replyDraftInfo('Для напоминаний по умолчанию используются ваши фото. Их можно загрузить сейчас или выбрать поиск в интернете. Результат проверьте через «Превью».', {
-    reply_markup: { inline_keyboard: [
-      [{ text: `${state.draft.imageSource === 'manual' ? '✅ ' : ''}Загрузить свои фото`, callback_data: 'source:manual' }],
-      [{ text: `${state.draft.imageSource === 'internet' ? '✅ ' : ''}Взять фото из интернета`, callback_data: 'source:internet' }],
-      [{ text: '← К черновику', callback_data: 'nav:back' }]
-    ] }
-  });
+  if (action === 'image_source') return selectDraftImageSource('manual');
   if (action === 'time') {
-    if (state.draft.editingCampaignId && state.jobs.some(j => j.campaignId === state.draft.editingCampaignId && ['sent', 'published', 'deleted'].includes(j.status))) throw new Error('Пост уже опубликован. Перенести время выхода после публикации нельзя');
+    const campaign = state.campaigns.find(c => c.id === state.draft.editingCampaignId);
+    if (campaign && campaignHasStarted(campaign, state.jobs)) throw new Error('Серия уже началась. Для продления измените «Конец рекламы».');
     return promptMode('post_time', 'Когда опубликовать пост? Например: «19», «1928», «завтра 18:00» или «25.09 18:00». Время московское.');
   }
   if (action === 'end') {
-    if (state.draft.editingCampaignId && state.jobs.some(j => j.campaignId === state.draft.editingCampaignId && ['sent', 'published', 'deleted'].includes(j.status))) throw new Error('После выхода серии конец рекламы изменить нельзя');
-    return promptMode('ad_end', 'Когда заканчивается размещение рекламы? Например: «завтра 21:00» или «25.09 21:00». Последняя напоминалка успеет удалиться до конца размещения.');
+    return promptMode('ad_end', 'Когда заканчивается размещение рекламы? Например: «01:00», «завтра 01:00» или «25.09 21:00». Можно продлить уже запущенную серию: дополнительные напоминания появятся в очереди после сохранения.');
   }
   if (action === 'delete') {
     state.mode = 'post_delete';
@@ -1469,12 +1640,31 @@ async function handleCallback(callback) {
       reply_markup: timerKeyboard('reminder_delete', 'nav:back')
     });
   }
-  if (action === 'button') return promptMode('button', 'Отправьте кнопку одной строкой: СМОТРЕТЬ ПРОГНОЗ - https://t.me/+ссылка. Она сразу заменит текущую кнопку.');
+  if (['button', 'button_regular', 'button_continuation'].includes(action)) {
+    if (action === 'button_continuation' || action === 'button' && state.draft.buttonMode === 'hidden') {
+      state.draft.hiddenSetup = {};
+      return promptMode('hidden_title', 'Шаг 1 из 3. Пришлите название кнопки, например: ЗАБРАТЬ ПРОГНОЗ. До 64 символов.', {
+        reply_markup: buttonTypeKeyboard(true)
+      });
+    }
+    const nextMode = 'regular';
+    if (nextMode !== (state.draft.buttonMode || 'regular')) {
+      state.draft.buttonMode = nextMode;
+      markEdited();
+    }
+    return promptMode('button', 'Обычная кнопка: пришлите ТЕКСТ КНОПКИ - https://example.com/ . Подходит любой сайт по HTTP/HTTPS. Можно выбрать скрытое продолжение или убрать кнопку.', {
+        reply_markup: buttonTypeKeyboard()
+      });
+  }
   if (action === 'clear_buttons') {
     if (!state.draft) throw new Error('Черновик не найден');
     state.draft.buttons = [];
     state.draft.url = null;
     state.draft.buttonText = null;
+    state.draft.buttonMode = 'regular';
+    state.draft.hiddenContinuation = null;
+    state.draft.hiddenSetup = null;
+    state.mode = null;
     markEdited();
     await save();
     return showDraft();
@@ -1511,16 +1701,21 @@ async function handleCallback(callback) {
     await clearPreviewMessages();
     return reply('Создание напоминаний отменено.', { reply_markup: MENU });
   }
-  if (action === 'defer') {
+  if (action === 'set_schedule') {
+    if (state.draft.remindersEnabled === false) return promptMode('post_only_time', 'Когда опубликовать пост? Введите московское время: 19, 1928, завтра 19 или 25.09 19:28.');
+    return promptMode('schedule_start', 'Когда бот должен опубликовать рекламу? Введите московское время: 19, 1928, завтра 19 или 25.09 19:28.');
+  }
+  if (action === 'defer' || action === 'defer_reminders') {
+    const mode = action === 'defer_reminders' ? 'reminders_only' : 'plan';
     if (state.draft.remindersEnabled === false) {
-      if (!state.draft.postAt) return promptMode('post_only_time', 'Когда опубликовать пост? Введите московское время: 19, 1928, завтра 19 или 25.09 19:28.');
-      return publish('plan');
+      if (!state.draft.postAt) throw new Error('Сначала нажмите «Ввести время».');
+      return publish(mode);
     }
     if (state.draft.postAt && state.draft.adEnd) {
-      if (!state.draft.previewedAt || state.draft.previewedAt < state.draft.editedAt) return briefNotice('Время задано. Нажмите «Превью», затем «Отложить» ещё раз.');
-      return publish('plan');
+      if (!previewIsCurrent(state.draft) && !shouldPreparePreview(state.draft) && !preparationQueue.hasCurrent(currentUserId(), state.draft, state.draft.editedAt)) return briefNotice('Время задано. Нажмите «Превью», затем «Отложить» ещё раз.');
+      return publish(mode);
     }
-    return promptMode('schedule_start', 'Когда бот должен опубликовать рекламу? Введите московское время: 19, 1928, завтра 19 или 25.09 19:28. Обычно первая напоминалка выходит через 30 минут; если реклама удаляется раньше, время подстроится под её таймер.');
+    throw new Error('Сначала нажмите «Ввести время» и укажите начало и конец рекламы.');
   }
   if (action === 'publish_now') {
     if (state.draft.editingCampaignId) throw new Error('Из редактора существующей серии нельзя опубликовать копию сразу');
@@ -1531,7 +1726,7 @@ async function handleCallback(callback) {
       markEdited();
       await save();
     }
-    if (!state.draft.previewedAt || state.draft.previewedAt < state.draft.editedAt) return preview();
+    if (!previewIsCurrent(state.draft) && !shouldPreparePreview(state.draft)) return preview();
     return publish('now');
   }
   throw new Error('Неизвестная кнопка редактора');
@@ -1543,7 +1738,7 @@ async function handleCommand(text) {
   const value = args.join(' ').trim();
   if (command === '/start' || command === '/help') {
     await showMenu();
-    await reply('Отправьте текст или фото поста — появится черновик. Выберите сетку и настройте кнопку. «Опубликовать сейчас» отправит пост сразу; «Отложить» спросит время. Если напоминания не нужны, выключите их в черновике. Для серии с напоминаниями нужны матч, коэффициент и конец размещения.');
+    await reply('Отправьте текст или фото поста — появится черновик. Выберите сетку и настройте кнопку. Через «Ввести время» задайте расписание, затем нажмите «Отложить». «Опубликовать сейчас» отправит пост сразу. Если напоминания не нужны, выключите их в черновике.');
   } else if (command === '/new') {
     state.mode = 'ad';
     await save();
@@ -1553,6 +1748,7 @@ async function handleCommand(text) {
     const schedule = parseScheduleCommand(text);
     Object.assign(state.draft, { postAt: schedule.start, adEnd: schedule.end, reminderDeleteAfter: schedule.deleteAfter,
       url: schedule.url, buttonText: schedule.buttonText, buttons: [{ text: schedule.buttonText, url: schedule.url }], remindersEnabled: true });
+    syncAutomaticPostDeletion(state.draft);
     markEdited();
     await save();
     await showDraft();
@@ -1561,22 +1757,25 @@ async function handleCommand(text) {
     const at = parseFlexibleMoscow(value);
     if (command === '/time') state.draft.postAt = at;
     else state.draft.adEnd = at;
+    syncAutomaticPostDeletion(state.draft);
     markEdited();
     await save();
     await showDraft();
   } else if (command === '/delete') {
     if (!state.draft) throw new Error('Сначала пришлите пост');
+    const previous = state.draft.reminderDeleteAfter;
     state.draft.reminderDeleteAfter = parseReminderDeleteMinutes(value);
-    markEdited();
+    if (previous !== state.draft.reminderDeleteAfter) markEdited(previous != null);
     await save();
     await showDraft();
   } else if (command === '/button') {
     if (!state.draft) throw new Error('Сначала пришлите пост');
+    const previous = postButtons(state.draft)[0];
     const button = parseButtonSpec(value);
     state.draft.buttons = [button];
     state.draft.url = button.url;
     state.draft.buttonText = button.text;
-    markEdited();
+    if (JSON.stringify(previous) !== JSON.stringify(button)) markEdited(Boolean(previous));
     await save();
     await showDraft();
   } else if (command === '/network') {
@@ -1705,7 +1904,7 @@ async function handleMessage(message) {
       if (!text.trim()) throw new Error('Пришлите текст напоминания');
       const formatted = messageToTemplate(text, message.entities || message.caption_entities || []);
       const caption = renderTemplate(formatted, { matches: campaign.matches, odds: campaign.odds,
-        sportIcon: sportIcon(campaign.sourceText), sourceText: campaign.sourceText });
+        sportIcon: sportIcon(campaign.sourceText), sourceText: campaign.sourceText, sourceEntities: campaign.sourceEntities || [] });
       if (caption.length > (campaign.messageFormat === 'rich' ? 32768 : 1024)) throw new Error('Текст напоминания слишком длинный');
       validateCaptionRepetitions(campaign.times.map((_, i) => i === index ? caption : reminderCaptionFor(campaign, i)));
       patch = { caption };
@@ -1729,7 +1928,7 @@ async function handleMessage(message) {
     state.mode = null;
     state.editReminder = null;
     await save();
-    await showPlanItem(id, String(index));
+    await showReminderEditor(id, index);
   } else if (state.mode === 'post_delete_live') {
     const id = state.modeCampaignId;
     const campaign = state.campaigns.find(item => item.id === id);
@@ -1738,10 +1937,36 @@ async function handleMessage(message) {
     if (!campaign?.postManaged || !jobs.some(job => ['pending', 'sent', 'published'].includes(job.status))) throw new Error('Удаление этого поста уже нельзя изменить');
     const minutes = parsePostDeleteMinutes(text);
     setPostDeleteAfter(campaign, jobs, minutes);
+    campaign.postDeleteAuto = false;
     state.mode = null;
     state.modeCampaignId = null;
     await save();
     await showPlanItem(id, 'a');
+  } else if (['hidden_title', 'hidden_subscriber', 'hidden_non_subscriber'].includes(state.mode)) {
+    if (!state.draft?.hiddenSetup) throw new Error('Настройка скрытого продолжения закрыта. Выберите её в меню кнопки.');
+    if (state.mode === 'hidden_title') {
+      state.draft.hiddenSetup.title = hiddenText(text, 64);
+      state.mode = 'hidden_subscriber';
+      await save();
+      return sendPrompt('Шаг 2 из 3. Пришлите текст для подписчиков канала, например: Обе забьют — да. До 200 символов, без форматирования.', { reply_markup: buttonTypeKeyboard(true) });
+    }
+    if (state.mode === 'hidden_subscriber') {
+      state.draft.hiddenSetup.subscriberText = hiddenText(text);
+      state.mode = 'hidden_non_subscriber';
+      await save();
+      return sendPrompt('Шаг 3 из 3. Пришлите текст для тех, кто не подписан, например: Подпишись, чтобы забрать прогноз. До 200 символов, без форматирования.', { reply_markup: buttonTypeKeyboard(true) });
+    }
+    state.draft.hiddenContinuation = { ...state.draft.hiddenSetup,
+      nonSubscriberText: hiddenText(text), id: state.draft.hiddenContinuation?.id || randomUUID().replaceAll('-', '') };
+    state.draft.hiddenSetup = null;
+    state.draft.buttonMode = 'hidden';
+    state.draft.buttons = [];
+    state.draft.url = null;
+    state.draft.buttonText = state.draft.hiddenContinuation.title;
+    state.mode = null;
+    markEdited();
+    await save();
+    return showDraft();
   } else if (state.mode === 'ad') {
     createDraft(message);
     await save();
@@ -1760,7 +1985,11 @@ async function handleMessage(message) {
     markEdited();
     await save();
     await sendPrompt(`Фото ${state.draft.manualReminderPhotoIds.length} из ${limit} добавлено. Пришлите ещё или нажмите «Готово».`, {
-      reply_markup: { inline_keyboard: [[{ text: '✅ Готово', callback_data: 'manual:done' }, { text: '🗑 Очистить', callback_data: 'manual:reset' }]] }
+      reply_markup: { inline_keyboard: [
+        [{ text: '✅ Готово', callback_data: 'manual:done' }, { text: '🗑 Очистить', callback_data: 'manual:reset' }],
+        [{ text: '🌐 Искать фото в интернете', callback_data: 'source:internet' }],
+        [{ text: '← К черновику', callback_data: 'nav:back' }]
+      ] }
     });
   } else if (state.mode === 'photo') {
     if (!message.photo) throw new Error('Пришлите фотографию');
@@ -1777,11 +2006,12 @@ async function handleMessage(message) {
     markEdited();
     state.mode = 'schedule_end';
     await save();
-    await sendPrompt('Когда заканчивается размещение рекламы? Введите московское время: 21, 2130, завтра 21 или 25.09 21:30. Последняя напоминалка успеет удалиться до конца размещения.');
+    await sendPrompt('Когда заканчивается размещение рекламы? Введите московское время: 21, 2130, завтра 21 или 25.09 21:30. Пост автоматически удалится в это время, если вы не выбрали другой таймер или «Не удалять».');
   } else if (state.mode === 'schedule_end') {
     const end = parseFlexibleMoscow(text, Math.max(Date.now(), state.draft.postAt));
-    scheduleTimes(state.draft.postAt, end, state.draft.reminderDeleteAfter, state.draft.postDeleteAfter);
     state.draft.adEnd = end;
+    syncAutomaticPostDeletion(state.draft);
+    scheduleTimes(state.draft.postAt, end, state.draft.reminderDeleteAfter, state.draft.postDeleteAfter);
     markEdited();
     state.mode = null;
     await save();
@@ -1789,10 +2019,11 @@ async function handleMessage(message) {
   } else if (state.mode === 'publish_now_end') {
     state.draft.adEnd = parseFlexibleMoscow(text);
     state.draft.postAt = null;
+    syncAutomaticPostDeletion(state.draft, Date.now());
     markEdited();
     state.mode = null;
     await save();
-    await preview();
+    await preview({ showMessages: !state.draft.previewedAt, after: state.draft.previewedAt ? () => showDraft() : null });
   } else if (state.mode === 'copy_time' || state.mode === 'copy_delete') {
     if (!state.copyItem) throw new Error('Копия не выбрана');
     if (state.mode === 'copy_time') {
@@ -1806,12 +2037,18 @@ async function handleMessage(message) {
   } else if (['post_time', 'post_only_time', 'ad_end', 'post_delete', 'reminder_delete', 'button', 'odds', 'matches', 'replace_content', 'add_media'].includes(state.mode)) {
     if (!state.draft) throw new Error('Черновик не найден');
     const mode = state.mode;
+    const previousSetting = mode === 'button' ? postButtons(state.draft)[0] :
+      mode === 'post_delete' ? { minutes: state.draft.postDeleteAfter, automatic: state.draft.postDeleteAuto === true } :
+        mode === 'reminder_delete' ? state.draft.reminderDeleteAfter : undefined;
     if (mode === 'post_time' || mode === 'post_only_time') state.draft.postAt = parseFlexibleMoscow(text);
-    else if (mode === 'ad_end') state.draft.adEnd = parseFlexibleMoscow(text);
-    else if (mode === 'post_delete') state.draft.postDeleteAfter = parsePostDeleteMinutes(text);
+    else if (mode === 'ad_end') state.draft.adEnd = parseFlexibleMoscow(text, Math.max(Date.now(), state.draft.postAt || 0));
+    else if (mode === 'post_delete') {
+      state.draft.postDeleteAfter = parsePostDeleteMinutes(text);
+      state.draft.postDeleteAuto = false;
+    }
     else if (mode === 'reminder_delete') state.draft.reminderDeleteAfter = parseReminderDeleteMinutes(text);
     else if (mode === 'button') {
-      const button = parseButtonSpec(text);
+      const button = state.draft.buttonMode === 'continuation' ? parseContinuationSpec(text) : parseButtonSpec(text);
       state.draft.buttons = [button];
       state.draft.url = button.url;
       state.draft.buttonText = button.text;
@@ -1838,7 +2075,12 @@ async function handleMessage(message) {
       if (message.photo?.length) { state.draft.photoId = message.photo.at(-1).file_id; state.draft.mainMediaType = 'photo'; }
       else throw new Error('Пришлите одно фото');
     }
-    markEdited();
+    if (['post_time', 'ad_end'].includes(mode)) syncAutomaticPostDeletion(state.draft);
+    const nextSetting = mode === 'button' ? postButtons(state.draft)[0] :
+      mode === 'post_delete' ? { minutes: state.draft.postDeleteAfter, automatic: state.draft.postDeleteAuto === true } :
+        mode === 'reminder_delete' ? state.draft.reminderDeleteAfter : undefined;
+    const metadataChanged = ['button', 'post_delete', 'reminder_delete'].includes(mode) && JSON.stringify(previousSetting) !== JSON.stringify(nextSetting);
+    if (!['button', 'post_delete', 'reminder_delete'].includes(mode) || metadataChanged) markEdited(metadataChanged && (mode === 'post_delete' ? previousSetting.minutes != null : previousSetting != null));
     state.mode = null;
     await save();
     await showDraft();
@@ -1988,6 +2230,19 @@ async function processJobs(onlyCampaignId = null) {
     for (const job of state.jobs) {
       if (onlyCampaignId && job.campaignId !== onlyCampaignId) continue;
       const now = Date.now();
+      if (job.status === 'pending' && !CONFIGURED_CHANNELS.includes(String(job.chatId))) {
+        job.status = 'canceled';
+        job.retryAt = null;
+        job.failureNotificationPending = false;
+        job.ownerNotificationPending = false;
+        await save();
+        continue;
+      }
+      if (job.kind === 'post' && job.status === 'pending' && state.campaigns.find(c => c.id === job.campaignId)?.postRemoved) {
+        job.status = 'canceled';
+        await save();
+        continue;
+      }
       if (job.kind === 'reminder' && job.status === 'pending') {
         const campaign = state.campaigns.find(c => c.id === job.campaignId);
         if (campaign && reminderIsRemoved(campaign, job.index)) {
@@ -1998,11 +2253,12 @@ async function processJobs(onlyCampaignId = null) {
       }
       if (job.status === 'pending' && job.at <= now && (!job.retryAt || job.retryAt <= now)) {
         const campaign = state.campaigns.find(c => c.id === job.campaignId);
-        if (!campaign) { job.status = 'failed'; await save(); continue; }
+        if (!campaign) { job.status = 'failed'; health.incident(); await save(); continue; }
         if (now >= publicationDeadline(job, campaign)) {
           job.status = 'failed';
+          health.incident();
           job.lastError = `Время публикации истекло${job.lastError ? ` после ошибки: ${job.lastError}` : ''}`;
-          if (job.kind === 'post') {
+          if (job.kind === 'post' && campaign.postManaged) {
             job.failureNotificationPending = true;
             for (const reminder of state.jobs.filter(j => j.campaignId === job.campaignId && j.chatId === job.chatId && j.kind === 'reminder' && j.status === 'pending')) reminder.status = 'canceled';
           }
@@ -2032,24 +2288,25 @@ async function processJobs(onlyCampaignId = null) {
           job.publishedAt = sent.date ? sent.date * 1000 : Date.now();
           job.notificationChat = { title: sent.chat?.title || CHANNEL_TITLES.get(String(job.chatId)) || String(job.chatId),
             username: sent.chat?.username || '' };
-          job.ownerNotificationPending = true;
+          job.ownerNotificationPending = !(job.kind === 'post' && campaign.postRemoved);
           job.mediaId = job.kind === 'post' ? (campaign.mainMediaType === 'video' ? campaign.videoId : campaign.photoId) : reminderPhotoId;
           job.syncedVersion = campaign.version || 1;
           const deleteAfter = job.kind === 'post' ? campaign.postDeleteAfter : reminderDeleteAfterFor(campaign, job.index);
-          job.deleteAt = job.kind === 'reminder' && reminderIsRemoved(campaign, job.index) ? Date.now()
+          job.deleteAt = job.kind === 'post' && campaign.postRemoved || job.kind === 'reminder' && reminderIsRemoved(campaign, job.index) ? Date.now()
             : Number.isFinite(deleteAfter) ? job.at + deleteAfter * MINUTE : null;
           job.status = job.deleteAt ? 'sent' : 'published';
           await save();
         } catch (error) {
           job.attempts++;
           job.lastError = error.message;
-          job.status = shouldRetryPublication(error, job, campaign, Date.now()) ? 'pending' : 'failed';
+          job.status = job.kind === 'post' && campaign.postRemoved ? 'canceled' : shouldRetryPublication(error, job, campaign, Date.now()) ? 'pending' : 'failed';
           job.retryAt = now + (error.retryAfter || Math.min(2 ** job.attempts * 30, 600)) * 1000;
           await save();
           console.error(error);
           if (job.status === 'failed') {
-            if (job.kind === 'post') for (const reminder of state.jobs.filter(j => j.campaignId === job.campaignId && j.chatId === job.chatId && j.kind === 'reminder' && j.status === 'pending')) reminder.status = 'canceled';
-            if (job.kind === 'post') job.failureNotificationPending = true;
+            health.incident();
+            if (job.kind === 'post' && campaign.postManaged) for (const reminder of state.jobs.filter(j => j.campaignId === job.campaignId && j.chatId === job.chatId && j.kind === 'reminder' && j.status === 'pending')) reminder.status = 'canceled';
+            if (job.kind === 'post' && campaign.postManaged) job.failureNotificationPending = true;
             await save();
           }
         }
@@ -2078,12 +2335,16 @@ async function processJobs(onlyCampaignId = null) {
           job.deleteAt = Date.now() + (error.retryAfter || 60) * 1000;
           await save();
           console.error(error);
-          if (job.status === 'failed_delete') await replyError(`Не удалось удалить ${job.id}: ${error.message}`);
+          if (job.status === 'failed_delete') {
+            health.incident();
+            await replyError(`Не удалось удалить ${job.id}: ${error.message}`);
+          }
         }
       }
     }
     await notifyPublishedGroups(onlyCampaignId);
     await cleanupPublishedNotices();
+    if (!onlyCampaignId) health.jobsSucceeded();
   } finally { busy = false; }
 }
 
@@ -2104,8 +2365,9 @@ await telegram('setMyCommands', { commands: [
   { command: 'preview', description: 'Предпросмотр серии' }
 ] }).catch(error => console.error('Не удалось настроить меню команд:', error.message));
 
-setInterval(() => processJobs().catch(console.error), 5000);
-processJobs().catch(console.error);
+if (process.env.HEALTH_PORT) await startHealthServer(health, DIR, Number(process.env.HEALTH_PORT));
+setInterval(() => processJobs().catch(error => { health.incident(); console.error(error); }), 5000);
+processJobs().catch(error => { health.incident(); console.error(error); });
 const sleepGuard = await preventWindowsIdleSleep(DIR);
 if (sleepGuard) console.log('Автоматический сон Windows отключён, пока работает бот.');
 console.log('Бот запущен. Сетки:', NETWORKS);
@@ -2113,7 +2375,14 @@ console.log('Бот запущен. Сетки:', NETWORKS);
 while (true) {
   try {
     const updates = await telegram('getUpdates', { offset: state.offset, timeout: 20, allowed_updates: ['message', 'callback_query'] });
+    health.pollSucceeded();
     for (const update of updates) {
+      if (update.callback_query?.data?.startsWith('hidden:')) {
+        await answerHiddenContinuation(update.callback_query, rawState, telegram).catch(console.error);
+        state.offset = update.update_id + 1;
+        await save();
+        continue;
+      }
       const userId = update.message?.from?.id ?? update.callback_query?.from?.id;
       if (Number.isSafeInteger(userId) && userId > 0) {
         const access = await adminChannelsFor(userId);
@@ -2124,7 +2393,7 @@ while (true) {
           else if (update.message?.chat?.type === 'private') await telegram('sendMessage', { chat_id: userId,
             text: 'Нет доступа: у вас нет прав администратора ни в одном подключённом канале бота.' }).catch(console.error);
         } else {
-        await runForUser(userId, async () => {
+        await userActions.run(userId, () => runForUser(userId, async () => {
           try {
             const previousPromptId = state.promptMessageId;
             if (update.message) await handleMessage(update.message);
@@ -2134,7 +2403,7 @@ while (true) {
             console.error(error);
             await replyError(error.message).catch(console.error);
           }
-        });
+        }));
         }
       }
       state.offset = update.update_id + 1;

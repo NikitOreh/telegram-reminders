@@ -1,10 +1,12 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { imageShowsSportPeople, runLocalPersonDetector } from './image-people.js';
+import { imageShowsSportPeople, runLocalPersonDetector, closePersonDetector } from './image-people.js';
+
+after(() => closePersonDetector());
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const referencePhotos = [

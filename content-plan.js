@@ -17,7 +17,7 @@ export function shiftMoscowDay(day, offset) {
 export function contentPlanEntries(campaigns, jobs, day) {
   const entries = [];
   for (const campaign of campaigns) {
-    if (!campaign.standaloneReminder && Number.isFinite(campaign.postAt) && moscowDay(campaign.postAt) === day) {
+    if (!campaign.standaloneReminder && !campaign.remindersOnly && Number.isFinite(campaign.postAt) && moscowDay(campaign.postAt) === day) {
       const postJobs = jobs.filter(job => job.campaignId === campaign.id && job.kind === 'post');
       entries.push({ kind: 'ad', campaign, at: campaign.postAt,
         status: campaign.postManaged ? aggregateStatus(postJobs) : 'external', index: null });

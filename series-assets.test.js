@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compatibleReminderTemplates, distributeManualPhotos, reminderTemplateSport, repeatAtMostTwice, selectReminderTemplates, validateCaptionRepetitions } from './series-assets.js';
+import { compatibleReminderTemplates, distributeManualPhotos, reminderTemplateSport, repeatAtMostTwice, selectReminderTemplates, extendReminderTemplates, validateCaptionRepetitions } from './series-assets.js';
 
 test('картинки в серии не повторяются больше двух раз', () => {
   assert.deepEqual(repeatAtMostTwice(['a', 'b', 'c'], 6), ['a', 'b', 'c', 'a', 'b', 'c']);
@@ -58,4 +58,17 @@ test('теннисные и баскетбольные шаблоны не см�
   assert.deepEqual(compatibleReminderTemplates([neutral, tennis, basketball, football], '🎾'), [neutral, tennis]);
   assert.deepEqual(compatibleReminderTemplates([neutral, tennis, basketball, football], '🏀'), [neutral, basketball]);
   assert.deepEqual(compatibleReminderTemplates([neutral, tennis, basketball, football], 'mixed'), [neutral]);
+});
+
+test('при продлении сохраняются прежние шаблоны и выбираются новые без лишних повторов', () => {
+  const existing = ['A', 'B', 'C'];
+  const pool = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+  const result = extendReminderTemplates(existing, pool, 7, text => text, max => max - 1);
+  assert.deepEqual(result, pool);
+  assert.deepEqual(existing, ['A', 'B', 'C']);
+  const repeated = extendReminderTemplates(existing, pool, 10, text => text, max => max - 1);
+  validateCaptionRepetitions(repeated);
+  assert.deepEqual(repeated.slice(0, 3), existing);
+  assert.throws(() => extendReminderTemplates(existing, ['A', 'B', 'C'], 7, text => text), /не хватает/);
+  assert.throws(() => extendReminderTemplates(['A', 'B'], ['A', 'B'], 3, text => text), /не хватает/);
 });

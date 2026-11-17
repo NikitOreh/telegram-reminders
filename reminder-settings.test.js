@@ -1,6 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCampaignJobs, moveCampaignSchedule, reminderButtonFor, reminderCaptionFor, reminderDeleteAfterFor, reminderIsRemoved, reminderPhotoFor, reminderTimeFor, removeReminder, setPostDeleteAfter, setReminderOverride, validateReminderTime } from './reminder-settings.js';
+import { buildCampaignJobs, moveCampaignSchedule, reminderButtonFor, reminderCaptionFor, reminderDeleteAfterFor, reminderIsRemoved, reminderPhotoFor, reminderTimeFor, removeReminder, setPostDeleteAfter, setReminderOverride, syncAutomaticPostDeletion, validateReminderTime } from './reminder-settings.js';
+
+test('конец размещения автоматически задаёт удаление исходного поста', () => {
+  const start = Date.parse('2026-11-01T19:33:00+03:00');
+  const draft = { postAt: start, adEnd: Date.parse('2026-11-01T22:16:00+03:00'), postDeleteAuto: true };
+  assert.equal(syncAutomaticPostDeletion(draft), true);
+  assert.equal(draft.postDeleteAfter, 163);
+  draft.adEnd = Date.parse('2026-11-01T20:00:00+03:00');
+  syncAutomaticPostDeletion(draft);
+  assert.equal(draft.postDeleteAfter, 27);
+});
+
+test('явное «Не удалять» не заменяется автоматическим таймером', () => {
+  const draft = { postAt: 1_000_000, adEnd: 1_180_000, postDeleteAuto: false, postDeleteAfter: null };
+  assert.equal(syncAutomaticPostDeletion(draft), false);
+  assert.equal(draft.postDeleteAfter, null);
+  draft.postDeleteAuto = true;
+  assert.throws(() => syncAutomaticPostDeletion({ ...draft, adEnd: draft.postAt + 48 * 60 * 60_000 }), /47 часов 59 минут/);
+});
 
 test('время отдельной напоминалки свободное после рекламы, автоматический шаг не меняется', () => {
   const now = 1_000_000;

@@ -10,7 +10,7 @@
 
 ## Подготовка без остановки локального бота
 
-На Windows из папки проекта выполните `powershell -File .\deploy\yandex\package.ps1`. Скрипт создаст архив в `%TEMP%`, включая текущий `data.json` и `.env` без неиспользуемого ключа OpenAI, но без Windows `node_modules` и кэша. Архив содержит токен Telegram: не публикуйте его. Скопируйте архив на ВМ:
+На Windows из папки проекта выполните `powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\yandex\package.ps1`. Скрипт создаст архив в `%TEMP%`, включая текущий `data.json`, `.env` без неиспользуемого ключа OpenAI, модель распознавания людей и кэш изображений, но без Windows `node_modules`. Архив содержит токен Telegram: не публикуйте его. Скопируйте архив на ВМ:
 
 ```powershell
 scp -i "$env:USERPROFILE\.ssh\telegram-reminders-yc" ПУТЬ_К_АРХИВУ yc-user@ПУБЛИЧНЫЙ_IP:~/telegram-reminders.tar.gz
@@ -24,7 +24,7 @@ tar -xzf ~/telegram-reminders.tar.gz -C ~/telegram-reminders-stage
 sudo bash ~/telegram-reminders-stage/deploy/yandex/install.sh ~/telegram-reminders-stage
 ```
 
-Установщик скачивает Node.js 22 с официального сайта, сверяет SHA-256, устанавливает зависимости для Linux, проверяет доступ бота к Telegram и каналам и регистрирует `systemd`-службу. **Он не запускает и не включает бота.** На этом этапе локальный экземпляр продолжает публиковать сообщения.
+Установщик скачивает Node.js 22 с официального сайта, сверяет SHA-256, устанавливает Node.js- и Python-зависимости для Linux, проверяет доступ бота к Telegram и каналам и регистрирует `systemd`-службу. **Он не запускает и не включает бота.** На этом этапе локальный экземпляр продолжает публиковать сообщения.
 
 ## Переключение
 

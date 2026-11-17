@@ -10,7 +10,7 @@ source_dir="${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
 project_dir=/opt/telegram-reminders
 node_dir=/opt/node22
 
-for required in bot.js package.json package-lock.json data.json .env; do
+for required in bot.js package.json package-lock.json data.json .env detect-person.py requirements-vision.txt detector-models/person_detection_mediapipe_2023mar.onnx; do
   if [[ ! -f "$source_dir/$required" ]]; then
     echo "Missing $required in $source_dir" >&2
     exit 1
@@ -23,7 +23,7 @@ if systemctl is-active --quiet telegram-reminders.service; then
 fi
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl python3 xz-utils
+DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl python3 python3-pip xz-utils tesseract-ocr tesseract-ocr-rus
 
 if [[ ! -x "$node_dir/bin/node" ]] || ! "$node_dir/bin/node" --version | grep -q '^v22\.'; then
   temp_dir="$(mktemp -d)"
@@ -47,7 +47,10 @@ install -d -o reminderbot -g reminderbot -m 0700 "$project_dir"
 cp -a -- "$source_dir/." "$project_dir/"
 chown -R reminderbot:reminderbot "$project_dir"
 chmod 0600 "$project_dir/.env" "$project_dir/data.json"
+python3 -m json.tool "$project_dir/data.json" >/dev/null
 runuser -u reminderbot -- env "PATH=$node_dir/bin:$PATH" "$node_dir/bin/npm" ci --omit=dev --prefix "$project_dir"
+runuser -u reminderbot -- python3 -m pip install --disable-pip-version-check --upgrade --target "$project_dir/.cv-deps" -r "$project_dir/requirements-vision.txt"
+runuser -u reminderbot -- env "BOT_ROOT=$project_dir" python3 -c 'import os, sys; sys.path.insert(0, os.path.join(os.environ["BOT_ROOT"], ".cv-deps")); sys.path.insert(0, os.path.join(os.environ["BOT_ROOT"], "detector-models")); import cv2, numpy, mp_persondet; print("Photo detector ready:", cv2.__version__, numpy.__version__)'
 runuser -u reminderbot -- env "PATH=$node_dir/bin:$PATH" "$node_dir/bin/npm" run verify --prefix "$project_dir"
 install -d -o reminderbot -g reminderbot -m 0700 /var/backups/telegram-reminders
 install -m 0644 "$project_dir/deploy/yandex/telegram-reminders.service" /etc/systemd/system/

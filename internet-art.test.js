@@ -251,9 +251,26 @@ test('если фото первого матча не хватает, поис�
       ? [{ sourceUrl: 'https://example.com/hockey.jpg' }]
       : [{ sourceUrl: 'https://example.com/hockey.jpg' }, { sourceUrl: 'https://example.com/football.jpg' }];
   });
-  assert.deepEqual(calls.map(call => [call.sportIcon, call.needed]), [['🏒', 4], ['⚽️', 2]]);
+  assert.deepEqual(calls.map(call => [call.sportIcon, call.needed]), [['🏒', 4], ['⚽️', 3]]);
   assert.deepEqual(calls[1].used, ['https://example.com/hockey.jpg']);
   assert.deepEqual(images.map(image => image.sourceUrl), [
     'https://example.com/hockey.jpg', 'https://example.com/football.jpg'
   ]);
+});
+
+test('поиск не останавливается на половине фото и добирает разные до числа напоминаний', async () => {
+  const calls = [];
+  const { images } = await collectMatchBackgrounds([{ match: 'first' }, { match: 'second' }], 7, async (entry, needed) => {
+    calls.push(needed);
+    return Array.from({ length: entry.match === 'first' ? 4 : 8 }, (_, i) => ({ sourceUrl: `https://example.com/${entry.match}/${i}.jpg` }));
+  });
+  assert.deepEqual(calls, [7, 3]);
+  assert.equal(images.length, 7);
+  assert.equal(new Set(images.map(image => image.sourceUrl)).size, 7);
+});
+
+test('при нехватке уникальных фото сохраняется максимум найденных, а не только половина', async () => {
+  const { images } = await collectMatchBackgrounds([{ match: 'first' }, { match: 'second' }], 7, async entry =>
+    Array.from({ length: entry.match === 'first' ? 4 : 2 }, (_, i) => ({ sourceUrl: `https://example.com/${entry.match}/${i}.jpg` })));
+  assert.equal(images.length, 6);
 });

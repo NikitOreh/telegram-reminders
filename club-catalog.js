@@ -19,7 +19,7 @@ export const NHL_CLUBS = [
   ['Нэшвилл', 'Nashville Predators', 'Нэшвилл Предаторз'],
   ['Нью-Джерси', 'New Jersey Devils', 'Нью Джерси Девилз'],
   ['Айлендерс', 'New York Islanders', 'Нью-Йорк Айлендерс'],
-  ['Рейнджерс', 'New York Rangers', 'Нью-Йорк Рейнджерс'],
+  ['Рейнджерс', 'New York Rangers', 'Нью-Йорк Рейнджерс', 'Нью-Йорк'],
   ['Оттава', 'Ottawa Senators', 'Оттава Сенаторз'],
   ['Филадельфия', 'Philadelphia Flyers', 'Филадельфия Флайерз'],
   ['Питтсбург', 'Pittsburgh Penguins', 'Питтсбург Пингвинз'],

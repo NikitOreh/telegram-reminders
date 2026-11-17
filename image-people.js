@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createImageDetectorWorker } from './image-detector-worker.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CACHE_DIR = path.join(ROOT, 'internet-assets');
@@ -16,30 +17,26 @@ async function pythonExecutable() {
   catch { return process.platform === 'win32' ? 'python' : 'python3'; }
 }
 
-export function runLocalPersonDetector(image, options = {}) {
-  return new Promise(async (resolve, reject) => {
-    let child;
-    try {
-      child = spawn(options.python || await pythonExecutable(), [path.join(ROOT, 'detect-person.py')],
+let worker;
+let workerPython;
+
+export async function runLocalPersonDetector(image, options = {}) {
+  const python = options.python || await pythonExecutable();
+  if (!worker || python !== workerPython) {
+    worker?.close();
+    workerPython = python;
+    worker = createImageDetectorWorker({
+      spawnWorker: () => spawn(python, [path.join(ROOT, 'detect-person.py'), '--worker'],
         { cwd: ROOT, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
-          env: { ...process.env, BOT_ROOT: ROOT, PYTHONUTF8: '1' } });
-    } catch (error) { reject(error); return; }
-    let output = '';
-    let stderr = '';
-    const timer = setTimeout(() => child.kill(), 30_000);
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', chunk => { output += chunk; });
-    child.stderr.on('data', chunk => { stderr += chunk; });
-    child.on('error', error => { clearTimeout(timer); reject(error); });
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (code === 0 && /^(PASS|REJECT)\s*$/.test(output)) resolve(output.trim() === 'PASS');
-      else reject(new Error(`Локальный детектор людей не запустился: ${stderr.trim() || `код ${code}`}`));
+          env: { ...process.env, BOT_ROOT: ROOT, PYTHONUTF8: '1' } })
     });
-    child.stdin.on('error', () => {});
-    child.stdin.end(image);
-  });
+  }
+  return worker.run(image);
+}
+
+export function closePersonDetector() {
+  worker?.close();
+  worker = undefined;
 }
 
 export async function imageShowsSportPeople(image, _sportIcon, options = {}) {

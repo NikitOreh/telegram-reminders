@@ -62,3 +62,34 @@ export function validateCaptionRepetitions(captions) {
     counts.set(caption, next);
   }
 }
+
+export function extendReminderTemplates(existing, pool, count, render, pickIndex = randomInt) {
+  if (existing.length > count) throw new Error('Нельзя убрать историю шаблонов серии');
+  const chosen = [...existing];
+  const uses = new Map();
+  for (const template of existing) {
+    const caption = render(template);
+    uses.set(caption, (uses.get(caption) || 0) + 1);
+  }
+  const unique = [...new Map(pool.map(template => [render(template), template])).values()];
+  for (let index = unique.length - 1; index > 0; index--) {
+    const other = pickIndex(index + 1);
+    if (!Number.isInteger(other) || other < 0 || other > index) throw new Error('Некорректный источник случайных чисел');
+    [unique[index], unique[other]] = [unique[other], unique[index]];
+  }
+  const limit = count > 6 ? 2 : 1;
+  // Prefer unused texts before repeating an already used template.
+  for (let round = 0; round < limit && chosen.length < count; round++) {
+    for (const template of unique) {
+      const caption = render(template);
+      const used = uses.get(caption) || 0;
+      if (used > round) continue;
+      chosen.push(template);
+      uses.set(caption, used + 1);
+      if (chosen.length === count) break;
+    }
+  }
+  if (chosen.length < count) throw new Error('Для продления серии не хватает разных текстов. Добавьте шаблоны напоминаний.');
+  validateCaptionRepetitions(chosen.map(render));
+  return chosen;
+}
