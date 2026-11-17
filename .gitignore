@@ -19,6 +19,8 @@ credentials*.json
 *service-account*.json
 secrets*.json
 .cloud-tools/
+.posted-deps/
+private/
 *.zip
 *.tar.gz
 *.token

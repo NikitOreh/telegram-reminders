@@ -7,7 +7,12 @@
     "start": "node bot.js",
     "setup": "node setup.js",
     "verify": "node verify.js",
-    "test": "node --test"
+    "test": "node --test",
+    "posted:setup": "node integrations/posted/launcher.js setup",
+    "posted:login": "node integrations/posted/launcher.js login",
+    "posted:check": "node integrations/posted/launcher.js check",
+    "posted:inspect": "node integrations/posted/launcher.js inspect",
+    "posted:schema": "node integrations/posted/launcher.js schema"
   },
   "engines": {
     "node": ">=22"
